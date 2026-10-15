@@ -42,6 +42,7 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
+
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
@@ -49,18 +50,98 @@ jobs:
           service_account: ${{ secrets.wif_service_account }}
           create_credentials_file: true
           export_environment_variables: true
+
       - name: Install CodeMender CLI
         run: |
           curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
           unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
           chmod +x "$RUNNER_TEMP/cm/cm"
           echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+          cm init
+      
+      - name: Update config.yaml with file types
+        shell: python
+        run: |
+          import os
+          import yaml
+    
+          config_file = os.path.expanduser('~/.codemender/config.yaml')
+            
+          # # 1. Discover all unique file extensions, excluding .git
+          # extensions = set()
+          # for root, _, files in os.walk('.'):
+          #     if '.git' in root:
+          #         continue
+          #     for file in files:
+          #         _, ext = os.path.splitext(file)
+          #         if ext:
+          #             extensions.add(ext)
+          # 1. Declare file types to add
+          extensions_list = [
+            ".aspx", 
+            ".cshtml", 
+            ".vbhtml", 
+            ".php", 
+            ".vue", 
+            ".sql", 
+            ".pkh", 
+            ".pkb", 
+            ".tsql", 
+            ".abap",
+            ".acds",
+            ".abdl",
+            ".cls", 
+            ".trigger", 
+            ".ipynb", 
+            ".pl", 
+            ".pm", 
+            ".sh", 
+            ".vb", 
+            ".vbp", 
+            ".frm", 
+            ".bas", 
+            ".cls-meta.xml", 
+            ".pls"
+          ]  
+    
+          # 2. Load existing config
+          if os.path.exists(config_file):
+              with open(config_file, 'r') as f:
+                  config = yaml.safe_load(f) or {}
+          else:
+              print("Config not found")
+              config = {}
+    
+          # Ensure the list key exists (assuming the key is 'file_types')
+          list_key = 'include'
+          if list_key not in config['scan']['extensions'] or config['scan']['extensions'][list_key] is None:
+              config['scan']['extensions'][list_key] = []
+    
+          # 3. Add new extensions
+          updated = False
+          for ext in extensions_list:
+            if ext not in config['scan']['extensions'][list_key]:
+                  config['scan']['extensions'][list_key].append(ext)
+                  updated = True
+    
+          # 4. Write back if changes were made
+          if updated:
+              with open(config_file, 'w') as f:
+                  yaml.dump(config, f, default_flow_style=False)
+              print(f"Updated {config_file} with new extensions:")
+          else:
+              print("No new extensions found.")
+
+      - name: Print config.yaml
+        run: |
+          cat ~/.codemender/config.yaml
+
       - name: Configure .cmignore for Shard ${{ matrix.shard }}/10 (Keep All Files on Disk)
         env:
           SHARD_INDEX: ${{ matrix.shard }}
           TOTAL_SHARDS: "10"
+        shell: python
         run: |
-          python3 - << 'EOF'
           import heapq
           import os
           from collections import defaultdict
@@ -137,11 +218,9 @@ jobs:
               f"scanning {kept_files}/{total_files} files ({kept_bytes / 1024:.1f} KB), "
               f"ignoring {len(ignored_paths)} files (all {total_files} files remain on disk)."
           )
-          EOF
 
       - name: Run CodeMender Deep Scan (Shard ${{ matrix.shard }}/10)
         run: |
-          cm init
           cm find . \
             --deep \
             --deep-workers="$CM_WORKERS" \
@@ -149,7 +228,7 @@ jobs:
             --sandbox=false
           cm report -f md > "codemender-results-shard-${{ matrix.shard }}.md"
           cm report -f json > "codemender-results-shard-${{ matrix.shard }}.json"
-          cat "codemender-results-shard-${{ matrix.shard }}.md" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload Shard Report Artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -159,24 +238,83 @@ jobs:
             codemender-results-shard-${{ matrix.shard }}.md
             codemender-results-shard-${{ matrix.shard }}.json
           retention-days: 7
+
   aggregate-results:
     name: Aggregate CodeMender Results
     needs: deep-scan-shard
     if: always()
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.wif_provider }}
+          service_account: ${{ secrets.wif_service_account }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Install CodeMender CLI
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
+          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
+          chmod +x "$RUNNER_TEMP/cm/cm"
+          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+          cm init
+
       - name: Download All Shard Reports
         uses: actions/download-artifact@v4
         with:
           pattern: codemender-report-shard-*
           path: shard-reports
           merge-multiple: true
-      - name: Publish Combined Report Summary
+
+      - name: Merge and Import Shard Findings
         run: |
-          echo "# CodeMender Deep Scan — Combined Report (10 Shards)" >> "$GITHUB_STEP_SUMMARY"
-          for i in $(seq 1 10); do
-            if [ -f "shard-reports/codemender-results-shard-${i}.md" ]; then
-              echo -e "\n## Shard ${i}/10\n" >> "$GITHUB_STEP_SUMMARY"
-              cat "shard-reports/codemender-results-shard-${i}.md" >> "$GITHUB_STEP_SUMMARY"
-            fi
-          done
+          shopt -s nullglob
+          json_files=(shard-reports/codemender-results-shard-*.json)
+
+          if [ "${#json_files[@]}" -eq 0 ]; then
+            echo "[]" > merged-findings.json
+          else
+            jq -s '
+              [
+                .[]
+                | if type == "array" then .[]
+                  elif type == "object" and (.findings | type == "array") then .findings[]
+                  else empty
+                  end
+              ]
+              | unique_by(.file_path, (.line // .start_line), .title)
+              | map(. + {
+                  file_path: .file_path,
+                  title: .title,
+                  message: (.message // .description // .title),
+                  severity: .severity,
+                  vuln_type: (.vuln_type // "CWE-Other"),
+                  vuln_id: (.vuln_id),
+                  confidence: (.confidence),
+                  analysis: (.analysis),
+                  snippet: (.snippet),
+                  start_line: (.start_line),
+                  end_line: (.end_line)
+                })
+            ' "${json_files[@]}" > merged-findings.json
+          fi
+
+          count=$(jq 'length' merged-findings.json)
+          echo "Total merged findings across all shards: $count"
+
+          if [ "$count" -gt 0 ]; then
+            cm report import -f merged-findings.json
+          fi
+
+          cm report -f md > summary.md
+          cat summary.md >> $GITHUB_STEP_SUMMARY
+          
+
