@@ -53,10 +53,10 @@ jobs:
 
       - name: Install CodeMender CLI
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
-          unzip -q "$RUNNER_TEMP/cm.zip"
-          chmod +x "$RUNNER_TEMP/cm"
-          sudo mv "$RUNNER_TEMP/cm" /usr/local/bin/cm
+          curl -fsSL -o cm-linux-amd64.zip "$CM_DOWNLOAD_URL"
+          unzip -q cm-linux-amd64.zip
+          chmod +x cm
+          sudo mv cm /usr/local/bin/cm
           cm --version
           # Initialize Workspace
           cm init
