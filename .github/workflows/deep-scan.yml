@@ -54,10 +54,12 @@ jobs:
       - name: Install CodeMender CLI
         run: |
           curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
-          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
-          chmod +x "$RUNNER_TEMP/cm/cm"
-          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
-          $GITHUB_PATH/cm init
+          unzip -q "$RUNNER_TEMP/cm.zip"
+          chmod +x "$RUNNER_TEMP/cm
+          sudo mv "$RUNNER_TEMP/cm" /usr/local/bin/cm
+          cm --version
+          # Initialize Workspace
+          cm init
       
       - name: Update config.yaml with file types
         shell: python
