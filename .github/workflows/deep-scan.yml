@@ -57,7 +57,7 @@ jobs:
           unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
           chmod +x "$RUNNER_TEMP/cm/cm"
           echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
-          cm init
+          $GITHUB_PATH/cm init
       
       - name: Update config.yaml with file types
         shell: python
