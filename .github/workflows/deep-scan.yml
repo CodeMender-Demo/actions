@@ -293,15 +293,14 @@ jobs:
               | map(. + {
                   file_path: .file_path,
                   title: .title,
-                  message: (.message // .description // .title),
                   severity: .severity,
-                  vuln_type: (.vuln_type // "CWE-Other"),
-                  vuln_id: (.vuln_id),
-                  confidence: (.confidence),
-                  analysis: (.analysis),
-                  snippet: (.snippet),
-                  start_line: (.start_line),
-                  end_line: (.end_line)
+                  vuln_type: .vuln_type,
+                  vuln_id: .vuln_id,
+                  confidence: .confidence,
+                  analysis: .analysis,
+                  snippet: .snippet,
+                  start_line: .start_line,
+                  end_line: .end_line
                 })
             ' "${json_files[@]}" > merged-findings.json
           fi
