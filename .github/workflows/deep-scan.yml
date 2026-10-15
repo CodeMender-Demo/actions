@@ -55,7 +55,7 @@ jobs:
         run: |
           curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
           unzip -q "$RUNNER_TEMP/cm.zip"
-          chmod +x "$RUNNER_TEMP/cm
+          chmod +x "$RUNNER_TEMP/cm"
           sudo mv "$RUNNER_TEMP/cm" /usr/local/bin/cm
           cm --version
           # Initialize Workspace
