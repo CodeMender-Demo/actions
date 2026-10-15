@@ -68,16 +68,7 @@ jobs:
           import yaml
     
           config_file = os.path.expanduser('~/.codemender/config.yaml')
-            
-          # # 1. Discover all unique file extensions, excluding .git
-          # extensions = set()
-          # for root, _, files in os.walk('.'):
-          #     if '.git' in root:
-          #         continue
-          #     for file in files:
-          #         _, ext = os.path.splitext(file)
-          #         if ext:
-          #             extensions.add(ext)
+
           # 1. Declare file types to add
           extensions_list = [
             ".aspx", 
@@ -151,9 +142,13 @@ jobs:
           shard_idx = int(os.environ["SHARD_INDEX"]) - 1
           total_shards = int(os.environ["TOTAL_SHARDS"])
           include_exts = {
-              ".py", ".java", ".go", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
-              ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".cs", ".rs", ".kt", ".kts",
-              ".rb", ".php", ".sol", ".tf", ".hcl"
+              ".py", ".java", ".go", ".js", ".jsx", ".mjs", ".cjs",
+              ".ts", ".tsx", ".c", ".cc", ".cpp", ".cxx", ".h", 
+              ".hpp", ".cs", ".rs", ".kt", ".kts",
+              ".rb", ".php", ".sol", ".tf", ".hcl", ".aspx", 
+              ".cshtml", ".vbhtml", ".vue", ".sql",
+              ".pkh", ".pkb", ".tsql", ".abap", ".acds", ".abdl", ".cls", 
+              ".trigger", ".ipynb", ".pl", ".pm", ".sh", ".vb", ".vbp", ".frm", ".bas", ".cls-meta.xml", ".pls"
           }
           exclude_suffixes = (".min.js", ".generated.go", ".pb.go")
           exclude_dirs = {
@@ -263,10 +258,12 @@ jobs:
 
       - name: Install CodeMender CLI
         run: |
-          curl -fsSL -o "$RUNNER_TEMP/cm.zip" "$CM_DOWNLOAD_URL"
-          unzip -q -o "$RUNNER_TEMP/cm.zip" -d "$RUNNER_TEMP/cm"
-          chmod +x "$RUNNER_TEMP/cm/cm"
-          echo "$RUNNER_TEMP/cm" >> "$GITHUB_PATH"
+          curl -fsSL -o cm-linux-amd64.zip "$CM_DOWNLOAD_URL"
+          unzip -q cm-linux-amd64.zip
+          chmod +x cm
+          sudo mv cm /usr/local/bin/cm
+          cm --version
+          # Initialize Workspace
           cm init
 
       - name: Download All Shard Reports
