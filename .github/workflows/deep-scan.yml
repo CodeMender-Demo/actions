@@ -289,8 +289,10 @@ jobs:
                   else empty
                   end
               ]
-              | unique_by(.file_path, (.line // .start_line), .title)
+              # | unique_by(.file_path, (.line // .start_line), .title)
+              | unique_by(.finding_id, .file_path, .start_line, .title)
               | map(. + {
+                  finding_id: .finding_id,
                   file_path: .file_path,
                   title: .title,
                   severity: .severity,
