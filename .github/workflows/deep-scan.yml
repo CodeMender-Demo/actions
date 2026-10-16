@@ -310,10 +310,59 @@ jobs:
           count=$(jq 'length' merged-findings.json)
           echo "Total merged findings across all shards: $count"
 
-          if [ "$count" -gt 0 ]; then
-            cm report import -f merged-findings.json
-          fi
+          # if [ "$count" -gt 0 ]; then
+          #   cm report import -f merged-findings.json
+          # fi
 
+          # cm report -f md > summary.md
+          # cat summary.md >> $GITHUB_STEP_SUMMARY
+
+          python3 - << 'EOF'
+          import json, os, sqlite3
+          from datetime import datetime, timezone
+          db_path = os.path.expanduser("~/.codemender/state.db")
+          with open("merged-findings.json") as f:
+              findings = json.load(f)
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          conn = sqlite3.connect(db_path)
+          for item in findings:
+              sid = item.get("session_id") or "merged_session"
+              conn.execute(
+                  """INSERT OR IGNORE INTO sessions
+                     (session_id, operation_name, session_type, status, created_at, updated_at, project_root)
+                     VALUES (?, 'find', 'FIND', 'COMPLETED', ?, ?, '.')""",
+                  (sid, now, now),
+              )
+              conn.execute(
+                  """INSERT OR REPLACE INTO findings
+                     (finding_id, session_id, title, file_path, severity, confidence,
+                      analysis, snippet, vuln_type, vuln_id, verified, muted, mute_reason,
+                      created_at, fingerprint, status, source_stage, finding_json,
+                      updated_at, start_line, end_line, dismiss_reason, confidence_level)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, '', ?, ?, ?, 'find', ?, ?, ?, ?, '', 'HIGH')""",
+                  (
+                      item["finding_id"],
+                      sid,
+                      item["title"],
+                      item["file_path"],
+                      item["severity"],
+                      int(item.get("confidence", 100)),
+                      item.get("analysis", ""),
+                      item.get("snippet", ""),
+                      item.get("vuln_type", ""),
+                      item.get("vuln_id", ""),
+                      now,
+                      item.get("fingerprint", ""),
+                      item.get("status", "OPEN"),
+                      json.dumps(item),
+                      now,
+                      int(item.get("start_line") or item.get("line") or 1),
+                      int(item.get("end_line") or item.get("start_line") or item.get("line") or 1),
+                  ),
+              )
+          conn.commit()
+          conn.close()
+          EOF
           cm report -f md > summary.md
           cat summary.md >> $GITHUB_STEP_SUMMARY
           
