@@ -305,6 +305,8 @@ jobs:
             ' "${json_files[@]}" > merged-findings.json
           fi
 
+          cat merged-findings.json
+
           count=$(jq 'length' merged-findings.json)
           echo "Total merged findings across all shards: $count"
 
