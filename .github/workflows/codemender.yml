@@ -1,0 +1,130 @@
+name: CodeMender
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: "CodeMender reasoning model"
+        required: false
+        default: "gemini-4-argon"
+        type: string
+      find:
+        description: "If CodeMender should execute a scan."
+        required: false
+        default: false
+        type: boolean
+      find_type:
+        description: "The type of scan CodeMender should execute. Must be one of deep, diff, quick"
+        required: false
+        default: "deep"
+        type: string
+      workers:
+        description: "Concurrent deep-scan workers per shard"
+        required: false
+        default: "10"
+        type: string
+      added_extensions:
+        description: "Comma separated list of file extensions to add to CodeMender's include list for scanning. For example: '.sh, .cs'"
+        required: false
+        type: string
+      verify:
+        description: "If CodeMender should verify a vulnerability"
+        required: false
+        default: false
+        type: boolean
+      fix:
+        description: "If CodeMender should fix a vulnerability"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      wif_provider:
+          required: true
+      wif_service_account:
+          required: true
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
+  CM_MODEL: ${{ inputs.model || 'gemini-4-argon' }}
+  CM_WORKERS: ${{ inputs.workers || '10' }}
+
+jobs:
+  find:
+    runs-on: ubuntu-22.04
+    if: inputs.find == true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.wif_provider }}
+          service_account: ${{ secrets.wif_service_account }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Install CodeMender CLI
+        run: |
+          curl -fsSL -o cm-linux-amd64.zip "$CM_DOWNLOAD_URL"
+          unzip -q cm-linux-amd64.zip
+          chmod +x cm
+          sudo mv cm /usr/local/bin/cm
+          cm --version
+          # Initialize Workspace
+          cm init
+
+      - name: Update config.yaml with file types
+        shell: python
+        run: |
+          import os
+          import yaml
+    
+          config_file = os.path.expanduser('~/.codemender/config.yaml')
+
+          # 1. Declare file types to add
+          extensions_list_from_input = ${{ inputs.added_extensions }}.split(",")
+          extension_list = []
+          for extension in extensions_list_from_input:
+            extension = extension.trim()
+            print(f"Adding extension: {extension}")
+            extension_list.append(extension)
+    
+          # 2. Load existing config
+          if os.path.exists(config_file):
+              with open(config_file, 'r') as f:
+                  config = yaml.safe_load(f) or {}
+          else:
+              print("Config not found")
+              config = {}
+    
+          # Ensure the list key exists (assuming the key is 'file_types')
+          list_key = 'include'
+          if list_key not in config['scan']['extensions'] or config['scan']['extensions'][list_key] is None:
+              config['scan']['extensions'][list_key] = []
+    
+          # 3. Add new extensions
+          updated = False
+          for ext in extensions_list:
+            if ext not in config['scan']['extensions'][list_key]:
+                  config['scan']['extensions'][list_key].append(ext)
+                  updated = True
+    
+          # 4. Write back if changes were made
+          if updated:
+              with open(config_file, 'w') as f:
+                  yaml.dump(config, f, default_flow_style=False)
+              print(f"Updated {config_file} with new extensions:")
+          else:
+              print("No new extensions found.")
+
+      - name: Print config.yaml
+        run: |
+          cat ~/.codemender/config.yaml
