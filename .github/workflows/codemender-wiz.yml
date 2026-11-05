@@ -1,3 +1,14 @@
+# on:
+#  secrets:
+#       WIF_PROVIDER:
+#         required: true
+#       WIF_SERVICE_ACCOUNT:
+#         required: true
+#       WIZ_CLIENT_ID:
+#         required: true
+#       WIZ_CLIENT_SECRET:
+#         required: true
+
 name: CodeMender Deep Scan to Wiz
 on:
   workflow_call:
@@ -12,15 +23,25 @@ on:
         required: false
         default: "10"
         type: string
+      max_shards:
+        description: "Maximum number of parallel shards"
+        required: false
+        default: "10"
+        type: string
+      files_per_shard:
+        description: "Target minimum scannable files per shard before splitting"
+        required: false
+        default: "25"
+        type: string
     secrets:
-      WIF_PROVIDER:
-        required: true
-      WIF_SERVICE_ACCOUNT:
-        required: true
-      WIZ_CLIENT_ID:
-        required: true
-      WIZ_CLIENT_SECRET:
-        required: true
+     WIF_PROVIDER:
+       required: true
+     WIF_SERVICE_ACCOUNT:
+       required: true
+     WIZ_CLIENT_ID:
+       required: true
+     WIZ_CLIENT_SECRET:
+       required: true
 
 permissions:
   contents: read
@@ -31,17 +52,108 @@ env:
   CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
   CM_MODEL: ${{ inputs.model || 'gemini-4-argon' }}
   CM_WORKERS: ${{ inputs.workers || '10' }}
+  MAX_SHARDS: ${{ inputs.max_shards || '10' }}
+  FILES_PER_SHARD: ${{ inputs.files_per_shard || '25' }}
   WIZ_AUTH_URL: https://auth.app.wiz.io/oauth/token
   WIZ_API_URL: https://api.us100.app.wiz.io/graphql
 
 jobs:
+  calculate-shards:
+    name: Calculate Dynamic Shard Count
+    runs-on: ubuntu-24.04
+    outputs:
+      total_shards: ${{ steps.calc.outputs.total_shards }}
+      shards_matrix: ${{ steps.calc.outputs.shards_matrix }}
+      total_files: ${{ steps.calc.outputs.total_files }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Determine optimal shard count
+        id: calc
+        shell: python
+        run: |
+          import json
+          import math
+          import os
+          from collections import defaultdict
+          from pathlib import Path
+
+          max_shards = max(1, int(os.environ.get("MAX_SHARDS", "10")))
+          files_per_shard = max(1, int(os.environ.get("FILES_PER_SHARD", "25")))
+
+          include_exts = {
+              ".py", ".java", ".go", ".js", ".jsx", ".mjs", ".cjs",
+              ".ts", ".tsx", ".c", ".cc", ".cpp", ".cxx", ".h",
+              ".hpp", ".cs", ".rs", ".kt", ".kts",
+              ".rb", ".php", ".sol", ".tf", ".hcl", ".aspx",
+              ".cshtml", ".vbhtml", ".vue", ".sql",
+              ".pkh", ".pkb", ".tsql", ".abap", ".acds", ".abdl", ".cls",
+              ".trigger", ".ipynb", ".pl", ".pm", ".sh", ".vb", ".vbp", ".frm", ".bas", ".cls-meta.xml", ".pls"
+          }
+          exclude_suffixes = (".min.js", ".generated.go", ".pb.go")
+          exclude_dirs = {
+              ".git", ".github", ".codemender", ".cm_project",
+              "node_modules", "vendor", "dist", "bin", "target", "obj", "build", ".gradle"
+          }
+
+          dir_groups = defaultdict(list)
+          total_files = 0
+          total_bytes = 0
+          for root, dirs, files in os.walk("."):
+              dirs[:] = sorted(d for d in dirs if d not in exclude_dirs and not d.startswith("."))
+              for fname in sorted(files):
+                  if fname.endswith(exclude_suffixes):
+                      continue
+                  ext = os.path.splitext(fname)[1].lower()
+                  if ext in include_exts:
+                      fpath = Path(root) / fname
+                      if not fpath.is_symlink():
+                          size = fpath.stat().st_size
+                          rel_dir = Path(root).as_posix()
+                          dir_groups[rel_dir].append((size, fpath.as_posix()))
+                          total_files += 1
+                          total_bytes += size
+
+          if total_files == 0:
+              total_shards = 0
+              shards_list = []
+          else:
+              target_shards = max(1, min(max_shards, math.ceil(total_files / files_per_shard)))
+              # Compute work units using the same grouping logic as the shard step
+              max_unit_files = max(1, total_files // (target_shards * 2)) if target_shards > 1 else total_files
+              num_units = 0
+              for rel_dir, flist in dir_groups.items():
+                  if len(flist) <= max_unit_files:
+                      num_units += 1
+                  else:
+                      num_units += len(flist)
+              total_shards = max(1, min(target_shards, num_units))
+              shards_list = list(range(1, total_shards + 1))
+
+          print(
+              f"Repository size: {total_files} scannable files ({total_bytes / 1024:.1f} KB) "
+              f"across {len(dir_groups)} directories -> using {total_shards} shard(s): {shards_list}"
+          )
+
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a") as out:
+              out.write(f"total_files={total_files}\n")
+              out.write(f"total_shards={total_shards}\n")
+              out.write(f"shards_matrix={json.dumps(shards_list)}\n")
+
   deep-scan-shard:
-    name: CodeMender Deep Scan (Shard ${{ matrix.shard }}/10)
+    name: CodeMender Deep Scan (Shard ${{ matrix.shard }}/${{ needs.calculate-shards.outputs.total_shards }})
+    needs: calculate-shards
+    if: needs.calculate-shards.outputs.total_files != '0'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+        shard: ${{ fromJson(needs.calculate-shards.outputs.shards_matrix) }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -52,8 +164,8 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
-          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ secrets.wif_provider }}
+          service_account: ${{ secrets.wif_service_account }}
           create_credentials_file: true
           export_environment_variables: true
 
@@ -135,10 +247,11 @@ jobs:
         run: |
           cat ~/.codemender/config.yaml
 
-      - name: Configure .cmignore for Shard ${{ matrix.shard }}/10 (Keep All Files on Disk)
+      - name: Configure .cmignore for Shard ${{ matrix.shard }}/${{ needs.calculate-shards.outputs.total_shards }} (Keep All Files on Disk)
+        id: shard-config
         env:
           SHARD_INDEX: ${{ matrix.shard }}
-          TOTAL_SHARDS: "10"
+          TOTAL_SHARDS: ${{ needs.calculate-shards.outputs.total_shards }}
         shell: python
         run: |
           import heapq
@@ -179,7 +292,7 @@ jobs:
           # 2. Build work units: keep sibling files in the same leaf directory together
           # for taint locality, unless a single directory holds > (total_files / total_shards)
           # files (e.g., a flat repo), in which case split that directory into individual files.
-          max_unit_files = max(1, total_files // (total_shards * 2))
+          max_unit_files = max(1, total_files // (total_shards * 2)) if total_shards > 1 else total_files
           units = []  # Each unit: (file_count, total_bytes, sort_key, [file_paths])
           for rel_dir, flist in dir_groups.items():
               if len(flist) <= max_unit_files:
@@ -191,7 +304,7 @@ jobs:
                       units.append((1, size_bytes, fpath, [fpath]))
           # 3. Sort largest units first (by file count, then byte size, then path for determinism)
           units.sort(key=lambda u: (-u[0], -u[1], u[2]))
-          # 4. Deal units into 10 shards using a min-heap keyed by (file_count, total_bytes, shard_id)
+          # 4. Deal units into total_shards using a min-heap keyed by (file_count, total_bytes, shard_id)
           heap = [(0, 0, i) for i in range(total_shards)]
           heapq.heapify(heap)
           kept_files = 0
@@ -206,23 +319,27 @@ jobs:
                   ignored_paths.extend(u_paths)
               heapq.heappush(heap, (count + u_count, tot_bytes + u_bytes, target_shard))
           # 5. Append non-shard file paths to .cmignore instead of deleting from disk
-          existing_ignore = ""
-          if os.path.exists(".cmignore"):
-              with open(".cmignore", "r") as f:
-                  existing_ignore = f.read().rstrip("\n") + "\n"
-          with open(".cmignore", "w") as f:
-              if existing_ignore:
-                  f.write(existing_ignore)
-              f.write(f"# Auto-generated exclusions for shard {shard_idx + 1}/{total_shards}\n")
-              for p in sorted(ignored_paths):
-                  f.write(f"{p}\n")
+          if ignored_paths:
+              existing_ignore = ""
+              if os.path.exists(".cmignore"):
+                  with open(".cmignore", "r") as f:
+                      existing_ignore = f.read().rstrip("\n") + "\n"
+              with open(".cmignore", "w") as f:
+                  if existing_ignore:
+                      f.write(existing_ignore)
+                  f.write(f"# Auto-generated exclusions for shard {shard_idx + 1}/{total_shards}\n")
+                  for p in sorted(ignored_paths):
+                      f.write(f"{p}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"kept_files={kept_files}\n")
           print(
               f"Shard {shard_idx + 1}/{total_shards} configured via .cmignore: "
               f"scanning {kept_files}/{total_files} files ({kept_bytes / 1024:.1f} KB), "
               f"ignoring {len(ignored_paths)} files (all {total_files} files remain on disk)."
           )
 
-      - name: Run CodeMender Deep Scan (Shard ${{ matrix.shard }}/10)
+      - name: Run CodeMender Deep Scan (Shard ${{ matrix.shard }}/${{ needs.calculate-shards.outputs.total_shards }})
+        if: steps.shard-config.outputs.kept_files != '0'
         run: |
           cm find . \
             --deep \
@@ -233,7 +350,7 @@ jobs:
           cm report -f json > "codemender-results-shard-${{ matrix.shard }}.json"
 
       - name: Upload Shard Report Artifact
-        if: always()
+        if: always() && steps.shard-config.outputs.kept_files != '0'
         uses: actions/upload-artifact@v4
         with:
           name: codemender-report-shard-${{ matrix.shard }}
@@ -244,8 +361,8 @@ jobs:
 
   aggregate-results:
     name: Aggregate CodeMender Results & Send to Wiz
-    needs: deep-scan-shard
-    if: always()
+    needs: [calculate-shards, deep-scan-shard]
+    if: always() && needs.calculate-shards.outputs.total_files != '0'
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
