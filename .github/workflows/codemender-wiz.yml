@@ -500,6 +500,182 @@ jobs:
               "status": "OPEN",
               "start_line": 35,
               "end_line": 43
+            },
+            {
+              "finding_id": "aaf9885d-8fb4-5b33-b2ac-20df060eb342",
+              "session_id": "ChBmZThmZjhiNGE2OWI3YTE3EAgaAmIyKgRtYWlu",
+              "title": "Stored and Reflected Cross-Site Scripting (XSS) in Security Audit Feed Endpoint",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/app/routers/reports.py",
+              "severity": "HIGH",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis\nThe `/api/v1/reports/audit-feed` endpoint in `view_security_audit_feed` (lines 70-88) is vulnerable to both Reflected and Stored Cross-Site Scripting (XSS).\n\n- **Source**:\n  1. Reflected input enters via the `filter_banner` HTTP query parameter (lines 72-75).\n  2. Stored untrusted input enters from database audit log records retrieved via `fetch_recent_audit_logs(db, limit=limit)` at line 86 (containing fields such as `actor`, `action`, `resource`, and `details`).\n- **Sanitization/Validation**: Neither `view_security_audit_feed` nor `render_audit_table_html` (in `app/services/audit_logger.py`, lines 38-97) performs HTML escaping (`html.escape()`) on `filter_banner` or the database record fields.\n- **Sink**: At lines 87-88, `render_audit_table_html(logs=logs, filter_banner=filter_banner)` interpolates `filter_banner` (at `app/services/audit_logger.py:58`) and log fields (`actor`, `action`, `resource`, `details` at `app/services/audit_logger.py:50-53`) directly into raw HTML, which is then served via `HTMLResponse(content=dashboard_html, status_code=200)` at line 88.\n\n### Conceptual Exploit Payload\n1. **Reflected XSS**:\n```http\nGET /api/v1/reports/audit-feed?filter_banner=%3Cscript%3Ealert(document.cookie)%3C/script%3E HTTP/1.1\nHost: localhost:8000\n```\n2. **Stored XSS**:\nAn attacker triggers an audited action with a malicious `actor` or `details` payload (e.g., `\u003cimg src=x onerror=alert(document.domain)\u003e`). When an administrator or user views `/api/v1/reports/audit-feed`, the stored payload is rendered unescaped inside the `\u003ctable\u003e` rows and executes arbitrary JavaScript in their browser.",
+              "snippet": "@router.get(\"/audit-feed\", response_class=HTMLResponse)\ndef view_security_audit_feed(\n    filter_banner: str = Query(\n        \"\",\n        description=\"Optional filter banner label displayed at the top of the dashboard\",\n    ),\n    limit: int = Query(25, ge=1, le=100),\n    db: sqlite3.Connection = Depends(get_db),\n):\n    logs = fetch_recent_audit_logs(db, limit=limit)\n    dashboard_html = render_audit_table_html(logs=logs, filter_banner=filter_banner)\n    return HTMLResponse(content=dashboard_html, status_code=200)",
+              "vuln_type": "IMPROPER NEUTRALIZATION OF INPUT DURING WEB PAGE GENERATION ('CROSS-SITE SCRIPTING')",
+              "vuln_id": "CWE-79",
+              "fingerprint": "0bf225ca1c87af9a",
+              "status": "OPEN",
+              "start_line": 70,
+              "end_line": 88
+            },
+            {
+              "finding_id": "d482ebd0-2578-588c-a100-2746957fd2cd",
+              "session_id": "ChA5MDYwMzMzNzUwYmM2YzdmEAgaAmYyKgRtYWlu",
+              "title": "Stored and Reflected Cross-Site Scripting (XSS) in render_audit_table_html",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/app/services/audit_logger.py",
+              "severity": "HIGH",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis: Stored and Reflected Cross-Site Scripting (XSS)\n\n**Source:**\n1. **Stored XSS Source:** Untrusted user input enters via HTTP requests to invoice endpoints in `app/routers/invoices.py`:\n   - `POST /invoices/` (`create_invoice`, lines 93-132), where `payload.billing_email`, `payload.invoice_number`, `payload.customer_name`, and `payload.currency` are passed to `record_audit_event()` and stored in the `audit_logs` SQLite table.\n   - `GET /invoices/search` (`search_invoices`, lines 55-61), where query parameters `customer_name` and `status` are formatted into `details` and stored in `audit_logs` via `record_audit_event()`.\n   When `GET /reports/audit-feed` (`view_security_audit_feed` in `app/routers/reports.py`, lines 70-88) is requested, `fetch_recent_audit_logs()` retrieves these stored records and passes them as `logs` to `render_audit_table_html()`.\n2. **Reflected XSS Source:** Untrusted user input enters via the `filter_banner` query parameter on `GET /reports/audit-feed` (`app/routers/reports.py`, line 72) and is passed directly as `filter_banner` to `render_audit_table_html()` on line 87.\n\n**Sanitization/Validation:**\nNone. `render_audit_table_html()` (lines 38-97) does not apply `html.escape()` or any HTML encoding/sanitization to `log['actor']`, `log['action']`, `log['resource']`, `log['details']`, or `filter_banner`.\n\n**Sink:**\nIn `app/services/audit_logger.py`:\n- Lines 46-55: `log['actor']`, `log['action']`, `log['resource']`, and `log['details']` are directly interpolated via Python f-strings into `\u003ctr\u003e\u003ctd\u003e...\u003c/td\u003e\u003c/tr\u003e` HTML table rows (`rows_html`).\n- Lines 57-61: `filter_banner` is directly interpolated via an f-string into `\u003cdiv class='alert-banner'\u003eActive Filter: {filter_banner}\u003c/div\u003e` (`banner_section`).\n- Lines 63-97: Both `banner_section` (line 80) and `rows_html` (line 93) are interpolated directly into the complete HTML document string, which is returned to the client via `HTMLResponse` (`text/html`).\n\n**Conceptual Exploit Payload:**\n1. **Reflected XSS:**\n   ```http\n   GET /reports/audit-feed?filter_banner=%3Cscript%3Ealert(document.domain)%3C/script%3E HTTP/1.1\n   Host: localhost:8000\n   ```\n   The payload `\u003cscript\u003ealert(document.domain)\u003c/script\u003e` is injected unescaped into `\u003cdiv class='alert-banner'\u003eActive Filter: \u003cscript\u003ealert(document.domain)\u003c/script\u003e\u003c/div\u003e` and executes immediately in the victim's browser.\n\n2. **Stored XSS:**\n   ```http\n   POST /invoices/ HTTP/1.1\n   Host: localhost:8000\n   Content-Type: application/json\n\n   {\n     \"invoice_number\": \"INV-9999\",\n     \"customer_name\": \"\u003cscript\u003ealert(document.cookie)\u003c/script\u003e\",\n     \"billing_email\": \"attacker@example.com\",\n     \"amount\": 100.0,\n     \"currency\": \"USD\",\n     \"status\": \"PENDING\"\n   }\n   ```\n   When any user subsequently visits `/reports/audit-feed`, the unescaped `customer_name` inside `log['details']` is rendered inside `\u003ctd\u003eCreated invoice for \u003cscript\u003ealert(document.cookie)\u003c/script\u003e (100.0 USD)\u003c/td\u003e`, executing arbitrary JavaScript in their browser session.",
+              "snippet": "def render_audit_table_html(logs: List[Dict[str, Any]], filter_banner: str = \"\") -\u003e str:\n    \"\"\"\n    Generate an HTML table summarizing recent security and operational audit events.\n    NOTE: Contains intentional Cross-Site Scripting (XSS) vulnerability for CodeMender demonstration:\n    `filter_banner` and `log['details']` / `log['actor']` are interpolated directly into HTML without escaping.\n    \"\"\"\n    rows_html = \"\"\n    for log in logs:\n        rows_html += (\n            f\"\u003ctr\u003e\"\n            f\"\u003ctd\u003e{log['id']}\u003c/td\u003e\"\n            f\"\u003ctd\u003e{log['timestamp']}\u003c/td\u003e\"\n            f\"\u003ctd\u003e{log['actor']}\u003c/td\u003e\"\n            f\"\u003ctd\u003e\u003cspan class='badge'\u003e{log['action']}\u003c/span\u003e\u003c/td\u003e\"\n            f\"\u003ctd\u003e{log['resource']}\u003c/td\u003e\"\n            f\"\u003ctd\u003e{log['details']}\u003c/td\u003e\"\n            f\"\u003c/tr\u003e\\n\"\n        )\n\n    banner_section = (\n        f\"\u003cdiv class='alert-banner'\u003eActive Filter: {filter_banner}\u003c/div\u003e\"\n        if filter_banner\n        else \"\"\n    )\n\n    return f\"\"\"\u003c!DOCTYPE html\u003e\n\u003chtml lang=\"en\"\u003e\n...\n\u003cbody\u003e\n    \u003ch1\u003eEnterprise Audit Trail\u003c/h1\u003e\n    {banner_section}\n    \u003ctable\u003e\n...\n        \u003ctbody\u003e\n            {rows_html}\n        \u003c/tbody\u003e\n    \u003c/table\u003e\n\u003c/body\u003e\n\u003c/html\u003e\"\"\"",
+              "vuln_type": "IMPROPER NEUTRALIZATION OF INPUT DURING WEB PAGE GENERATION ('CROSS-SITE SCRIPTING')",
+              "vuln_id": "CWE-79",
+              "fingerprint": "66569ef79c6a5759",
+              "status": "OPEN",
+              "start_line": 38,
+              "end_line": 97
+            },
+            {
+              "finding_id": "3b4fc61c-6417-5949-97d5-186edf32ee61",
+              "session_id": "ChA0OGJjZjVjNmZiOTFiNzI0EAgaAmMzKgRtYWlu",
+              "title": "Server-Side Request Forgery (SSRF) in test_webhook_delivery",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/app/routers/integrations.py",
+              "severity": "HIGH",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis\nThe `/api/v1/integrations/webhook-test` endpoint accepts a `WebhookTestRequest` JSON body and performs an outbound HTTP POST request to `payload.target_url` using `requests.post()`. It also allows arbitrary HTTP headers to be injected via `payload.custom_headers` and returns the upstream response status, headers, and up to 4096 characters of the response body directly to the caller (Full-Read SSRF).\n\n- **Source**: `payload.target_url` and `payload.custom_headers` from the `WebhookTestRequest` JSON body in `test_webhook_delivery` (line 14).\n- **Sanitization/Validation**: None. `WebhookTestRequest.target_url` is typed as a plain `str` without scheme, host, DNS resolution, or IP range (RFC 1918, loopback `127.0.0.0/8`, link-local `169.254.169.254`) validation, and `allow_redirects=True` is enabled.\n- **Sink**: `requests.post(payload.target_url, ...)` at lines 38-44, followed by returning `response.text[:4096]` at line 55.\n\n### Conceptual Exploit Payload\n```http\nPOST /api/v1/integrations/webhook-test HTTP/1.1\nHost: localhost:8000\nContent-Type: application/json\n\n{\n  \"target_url\": \"http://169.254.169.254/latest/meta-data/iam/security-credentials/\",\n  \"event_type\": \"invoice.paid\",\n  \"custom_headers\": {\n    \"Metadata\": \"true\"\n  }\n}\n```\nThis causes the server to issue an internal request to the cloud instance metadata service (or internal services on `127.0.0.1`) and return the sensitive response body in `response_body`.",
+              "snippet": "@router.post(\"/webhook-test\")\ndef test_webhook_delivery(payload: WebhookTestRequest):\n...\n    headers = {\"Content-Type\": \"application/json\", \"User-Agent\": \"FinPulse-Webhook/1.2\"}\n    if payload.custom_headers:\n        headers.update(payload.custom_headers)\n\n    try:\n        # Vulnerable outbound request to arbitrary user-specified URL\n        response = requests.post(\n            payload.target_url,\n            json=test_body,\n            headers=headers,\n            timeout=settings.WEBHOOK_TIMEOUT_SECONDS,\n            allow_redirects=True,\n        )\n...\n    return {\n        \"target_url\": payload.target_url,\n        \"status_code\": response.status_code,\n        \"response_headers\": dict(response.headers),\n        \"response_body\": response.text[:4096],\n    }",
+              "vuln_type": "SERVER-SIDE REQUEST FORGERY (SSRF)",
+              "vuln_id": "CWE-918",
+              "fingerprint": "b78511ab01e611de",
+              "status": "OPEN",
+              "start_line": 13,
+              "end_line": 56
+            },
+            {
+              "finding_id": "e04c70f0-c384-57a3-9150-6af081473adc",
+              "session_id": "ChA0OGJjZjVjNmZiOTFiNzI0EAgaAmMzKgRtYWlu",
+              "title": "Server-Side Request Forgery (SSRF) and Arbitrary File Read via urllib.request.urlopen in fetch_partner_exchange_rates",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/app/routers/integrations.py",
+              "severity": "HIGH",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis\nThe `/api/v1/integrations/fetch-exchange-rates` endpoint takes a user-controlled `provider_url` query parameter and passes it directly to `urllib.request.Request()` and `urllib.request.urlopen()`, returning the parsed JSON or raw response body (up to 4096 characters) to the client. Because `urllib.request.urlopen()` supports multiple URL schemes (including `http://`, `https://`, and `file://`) and no host/IP validation is performed, an unauthenticated attacker can perform full-read SSRF against internal network services or cloud metadata endpoints, as well as read arbitrary local files on the server via `file://` URIs.\n\n- **Source**: `provider_url` query parameter in `fetch_partner_exchange_rates` (lines 60-64).\n- **Sanitization/Validation**: None. There is no URL scheme restriction (allowing `file://`, `http://`, etc.) and no allowlist or blocklist check on the target hostname or resolved IP address.\n- **Sink**: `urllib.request.urlopen(req, ...)` at lines 79-82, with the response returned to the user at lines 91 and 93.\n\n### Conceptual Exploit Payload\n1. **Cloud Metadata / Internal Service SSRF**:\n```http\nGET /api/v1/integrations/fetch-exchange-rates?provider_url=http://169.254.169.254/latest/meta-data/ HTTP/1.1\nHost: localhost:8000\n```\n2. **Local File Disclosure via `file://` scheme**:\n```http\nGET /api/v1/integrations/fetch-exchange-rates?provider_url=file:///etc/passwd HTTP/1.1\nHost: localhost:8000\n```\nBoth requests reach `urllib.request.urlopen()` without restriction and return the retrieved data in `data` or `raw_response`.",
+              "snippet": "@router.get(\"/fetch-exchange-rates\")\ndef fetch_partner_exchange_rates(\n    provider_url: str = Query(\n        default=settings.DEFAULT_EXCHANGE_RATE_URL,\n        description=\"Remote JSON feed URL for currency exchange rates\",\n    ),\n):\n...\n    try:\n        req = urllib.request.Request(\n            provider_url,\n            headers={\"User-Agent\": \"FinPulse-FX-Sync/1.2\"},\n        )\n        with urllib.request.urlopen(\n            req, timeout=settings.WEBHOOK_TIMEOUT_SECONDS\n        ) as resp:\n            raw_data = resp.read().decode(\"utf-8\", errors=\"replace\")\n...\n    try:\n        parsed = json.loads(raw_data)\n        return {\"provider\": provider_url, \"data\": parsed}\n    except json.JSONDecodeError:\n        return {\"provider\": provider_url, \"raw_response\": raw_data[:4096]}",
+              "vuln_type": "SERVER-SIDE REQUEST FORGERY (SSRF)",
+              "vuln_id": "CWE-918",
+              "fingerprint": "07cc50b1d4629b85",
+              "status": "OPEN",
+              "start_line": 59,
+              "end_line": 93
+            },
+            {
+              "finding_id": "e22c5058-d893-5b62-972a-0c9dbe6004d4",
+              "session_id": "ChA1ZGU4ZWNiNTIyNjJmNzQwEAgaAjI0KgRtYWlu",
+              "title": "Timing Side-Channel Vulnerability in Webhook Token Verification",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/secrets/payment_gateway_service.py",
+              "severity": "HIGH",
+              "confidence": 95,
+              "analysis": "### Vulnerability Analysis\n- **Source**: Untrusted input `provided_token` passed to `verify_webhook_token(provided_token: str)` (line 54), originating from the incoming `X-Webhook-Auth` HTTP header.\n- **Sanitization/Validation**: Only checks `if not provided_token:` (line 65). No constant-time comparison function (such as `hmac.compare_digest`) is used.\n- **Sink**: Line 69 performs a direct `==` string equality comparison (`return provided_token == WEBHOOK_SIGNING_SECRET`), which terminates on the first mismatched byte and leaks timing information proportional to the matching prefix length.\n\n### Conceptual Exploit Payload\nAn attacker sends repeated webhook requests with candidate tokens of the target length, measuring response times to brute-force `WEBHOOK_SIGNING_SECRET` byte-by-byte:\n```http\nPOST /webhook HTTP/1.1\nHost: target.example.com\nX-Webhook-Auth: whsec_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n```\nOnce the full secret is recovered via statistical timing analysis, the attacker can forge arbitrary webhook events and bypass webhook authentication.",
+              "snippet": "def verify_webhook_token(provided_token: str) -\u003e bool:\n    \"\"\"\n    Validates incoming webhook authentication token.\n    \n    Vulnerability:\n    Standard string comparison ('==') compares strings byte-by-byte and returns\n    False immediately upon encountering the first mismatch. This introduces a\n    measurable timing side-channel, allowing an attacker to determine the secret\n    character by character.\n    Fix: Use hmac.compare_digest(provided_token, WEBHOOK_SIGNING_SECRET).\n    \"\"\"\n    if not provided_token:\n        return False\n        \n    # Naive string comparison vulnerable to timing side-channels\n    return provided_token == WEBHOOK_SIGNING_SECRET",
+              "vuln_type": "CWE-208",
+              "vuln_id": "CWE-208",
+              "fingerprint": "bf3f1c1a7d67e482",
+              "status": "OPEN",
+              "start_line": 54,
+              "end_line": 69
+            },
+            {
+              "finding_id": "b739cb83-5826-5dee-9d1f-ec1f57cbd4d6",
+              "session_id": "ChA1ZGU4ZWNiNTIyNjJmNzQwEAgaAjI0KgRtYWlu",
+              "title": "Exposure of Sensitive Authentication and Card Tokens in Error Logs and Responses",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/secrets/payment_gateway_service.py",
+              "severity": "HIGH",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis\n- **Source**: `transaction_id`, `auth_headers` (containing sensitive `Authorization` bearer tokens and `X-Card-Token` payment credentials), and `refund_amount_cents` passed into `process_settlement_refund` (lines 81-85).\n- **Sanitization/Validation**: When `refund_amount_cents \u003c= 0` (lines 94-95), a `ValueError` is raised and caught by `except Exception as err:` (line 106). Neither the local scope dictionary nor `auth_headers` are redacted before logging or returning the error dictionary.\n- **Sink**:\n  1. Lines 110-113: `logger.error(... f\"Execution Context: {locals()}\")` dumps all local variables—including `bearer_token`, `customer_card_token`, and `auth_headers`—into application logs (CWE-532).\n  2. Lines 114-118: The returned error response dictionary includes `\"debug_headers\": auth_headers`, directly exposing raw authentication and card tokens back to the caller/client (CWE-200).\n\n### Conceptual Exploit Payload\nAn attacker invokes the refund flow with an invalid (zero or negative) `refund_amount_cents` value:\n```json\n{\n  \"transaction_id\": \"txn_999\",\n  \"refund_amount_cents\": -100\n}\n```\nThis deterministically triggers `ValueError(\"Invalid refund amount: -100\")` at line 95, causing the exception handler at lines 106-118 to log `locals()` (leaking `bearer_token` and `customer_card_token` to centralized logging systems) and return `\"debug_headers\": auth_headers` in the response payload.",
+              "snippet": "def process_settlement_refund(\n    transaction_id: str, \n    auth_headers: Dict[str, str], \n    refund_amount_cents: int\n) -\u003e Dict[str, Any]:\n    \"\"\"\n    Processes customer refund requests and communicates with the gateway API.\n    \"\"\"\n    bearer_token = auth_headers.get(\"Authorization\", \"\")\n    customer_card_token = auth_headers.get(\"X-Card-Token\", \"\")\n    \n    try:\n        # Simulate validation check\n        if refund_amount_cents \u003c= 0:\n            raise ValueError(f\"Invalid refund amount: {refund_amount_cents}\")\n            \n        logger.info(f\"Processing refund for transaction {transaction_id}\")\n        \n        # Simulating gateway request\n        return {\n            \"status\": \"success\",\n            \"transaction_id\": transaction_id,\n            \"refunded_cents\": refund_amount_cents\n        }\n        \n    except Exception as err:\n        # Diagnostic logging that dumps all local function scope variables!\n        # Vulnerability: Leaks bearer_token, customer_card_token, and auth headers\n        # directly into centralized log streams (CloudWatch/Datadog/ELK).\n        logger.error(\n            f\"Failed to process refund for transaction {transaction_id}. \"\n            f\"Error: {err}. Execution Context: {locals()}\"\n        )\n        return {\n            \"status\": \"failed\",\n            \"error\": str(err),\n            \"debug_headers\": auth_headers  # Vulnerability: Returning auth secrets to client in response\n        }",
+              "vuln_type": "CWE-532",
+              "vuln_id": "CWE-532",
+              "fingerprint": "0c2b9c00fe1d2e93",
+              "status": "OPEN",
+              "start_line": 81,
+              "end_line": 118
+            },
+            {
+              "finding_id": "aa8ada59-3f90-5c9c-8ed3-7ddaa3c71bbd",
+              "session_id": "ChBlNWRjNmUwZmNjNDkyYmRmEAgaAmRjKgRtYWlu",
+              "title": "SQL Injection in search_invoices via Unsanitized Query Parameters",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/app/routers/invoices.py",
+              "severity": "HIGH",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis\nThe `/api/v1/invoices/search` endpoint (`search_invoices`) is vulnerable to SQL Injection because it constructs a raw SQL query using Python f-strings with untrusted query parameters before passing it to `cursor.execute()`.\n\n- **Source**: The HTTP query parameters `customer_name` (line 16), `status` (line 19), and `sort_by` (line 22) received in `search_invoices`.\n- **Sanitization/Validation**: None. FastAPI only validates that the inputs are strings; no parameterization, escaping, or allowlist validation (for `sort_by`) is performed before string interpolation at lines 37-45.\n- **Sink**: `cursor.execute(base_query)` at line 48.\n\n### Conceptual Exploit Payload\nAn unauthenticated attacker can send a GET request with a crafted `customer_name` (or `status` / `sort_by`) query parameter to break out of the string literal and inject arbitrary SQL clauses such as a `UNION SELECT`:\n\n```http\nGET /api/v1/invoices/search?customer_name=%27%20OR%201=1%20UNION%20SELECT%201,sql,name,type,0,%27USD%27,%27PAID%27,tbl_name,%272026-01-01%27%20FROM%20sqlite_master-- HTTP/1.1\nHost: localhost:8000\n```\n\nThis alters the executed SQL query to:\n```sql\nSELECT id, invoice_number, customer_name, billing_email, amount, currency, status, notes, created_at FROM invoices WHERE customer_name LIKE '%' OR 1=1 UNION SELECT 1,sql,name,type,0,'USD','PAID',tbl_name,'2026-01-01' FROM sqlite_master--%' ORDER BY created_at DESC\n```\nallowing the attacker to bypass filter logic and extract arbitrary records and schema details from the database.",
+              "snippet": "@router.get(\"/search\", response_model=List[InvoiceResponse])\ndef search_invoices(\n    request: Request,\n    customer_name: str = Query(\n        \"\", description=\"Filter invoices by customer name substring\"\n    ),\n    status: Optional[str] = Query(\n        None, description=\"Filter by invoice status (e.g., PAID, PENDING, OVERDUE)\"\n    ),\n    sort_by: str = Query(\n        \"created_at\", description=\"Column name to sort results by\"\n    ),\n    db: sqlite3.Connection = Depends(get_db),\n):\n    cursor = db.cursor()\n\n    # Vulnerable raw SQL string construction\n    base_query = (\n        f\"SELECT id, invoice_number, customer_name, billing_email, amount, currency, status, notes, created_at \"\n        f\"FROM invoices WHERE customer_name LIKE '%{customer_name}%'\"\n    )\n\n    if status:\n        base_query += f\" AND status = '{status}'\"\n\n    base_query += f\" ORDER BY {sort_by} DESC\"\n\n    try:\n        cursor.execute(base_query)\n        rows = cursor.fetchall()",
+              "vuln_type": "SQL INJECTION",
+              "vuln_id": "CWE-89",
+              "fingerprint": "6c4d0618c7c58177",
+              "status": "OPEN",
+              "start_line": 13,
+              "end_line": 63
+            },
+            {
+              "finding_id": "54a19d90-1e88-5d5b-bcc0-8f23a82d830b",
+              "session_id": "ChBlNWRjNmUwZmNjNDkyYmRmEAgaAmRjKgRtYWlu",
+              "title": "SQL Injection in lookup_invoice_by_number via Path Parameter",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/app/routers/invoices.py",
+              "severity": "HIGH",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis\nThe `/api/v1/invoices/lookup/{invoice_number}` endpoint (`lookup_invoice_by_number`) is vulnerable to SQL Injection because the `invoice_number` URL path parameter is directly interpolated into a raw SQL query string via an f-string and executed without parameterization.\n\n- **Source**: The path parameter `invoice_number: str` (line 68) in `lookup_invoice_by_number`.\n- **Sanitization/Validation**: None. No input validation, escaping, or parameterized query binding is applied before interpolating `invoice_number` into `query` at line 78.\n- **Sink**: `cursor.execute(query)` at line 81.\n\n### Conceptual Exploit Payload\nAn attacker can request the endpoint with a URL-encoded SQL injection payload in the `invoice_number` path segment:\n\n```http\nGET /api/v1/invoices/lookup/INV-000%27%20UNION%20SELECT%201,name,sql,type,0,%27USD%27,%27PAID%27,tbl_name,%272026-01-01%27%20FROM%20sqlite_master-- HTTP/1.1\nHost: localhost:8000\n```\n\nThis results in the execution of:\n```sql\nSELECT * FROM invoices WHERE invoice_number = 'INV-000' UNION SELECT 1,name,sql,type,0,'USD','PAID',tbl_name,'2026-01-01' FROM sqlite_master--'\n```\nallowing an attacker to extract unauthorized data from any table in the SQLite database or bypass the `WHERE` condition using `' OR '1'='1`.",
+              "snippet": "@router.get(\"/lookup/{invoice_number}\")\ndef lookup_invoice_by_number(\n    invoice_number: str,\n    db: sqlite3.Connection = Depends(get_db),\n):\n    cursor = db.cursor()\n    query = f\"SELECT * FROM invoices WHERE invoice_number = '{invoice_number}'\"\n\n    try:\n        cursor.execute(query)\n        row = cursor.fetchone()\n    except sqlite3.Error as exc:\n        raise HTTPException(status_code=400, detail=f\"Database error: {exc}\")\n\n    if not row:\n        raise HTTPException(status_code=404, detail=\"Invoice not found\")\n\n    return dict(row)",
+              "vuln_type": "SQL INJECTION",
+              "vuln_id": "CWE-89",
+              "fingerprint": "57f04913736809fd",
+              "status": "OPEN",
+              "start_line": 66,
+              "end_line": 89
+            },
+            {
+              "finding_id": "982cc8ae-4eb0-5553-b7be-b0dae898d40b",
+              "session_id": "ChBmZDM3OTA2NTI1YjJkOTdjEAgaAjhmKgRtYWlu",
+              "title": "Path Traversal in Document Download Endpoint (`/api/v1/documents/download`)",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/app/routers/documents.py",
+              "severity": "HIGH",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis: Path Traversal in `download_document`\n\n1. **Source**: Untrusted user input enters via the `filename` and `category` HTTP query parameters (`Query(...)`) in the `GET /api/v1/documents/download` endpoint (lines 12-19).\n2. **Sanitization/Validation**: None. Neither `category` nor `filename` is sanitized, resolved via `Path.resolve()` / `os.path.realpath()`, or checked to ensure the resulting path remains within `settings.DOCUMENTS_BASE_DIR`. Furthermore, in Python's `os.path.join()`, if any component is an absolute path (e.g., `/etc/passwd`), all preceding components are discarded entirely.\n3. **Sink**: At lines 31-33, `target_file_path` is constructed using `os.path.join(str(settings.DOCUMENTS_BASE_DIR), category, filename)`, checked with `os.path.exists(target_file_path)` (line 35), and opened for binary reading via `open(target_file_path, \"rb\")` (line 42), returning the raw file contents in the HTTP response (lines 49-55).\n\n### Conceptual Exploit Payload\nAn unauthenticated attacker can send a GET request with directory traversal sequences (or an absolute path) in `filename` or `category`:\n```http\nGET /api/v1/documents/download?category=receipts\u0026filename=../../../../etc/passwd HTTP/1.1\nHost: target-app.local\n```\n`os.path.join` preserves the `../` segments (or resets to root if `/etc/passwd` is passed directly), resolving outside `settings.DOCUMENTS_BASE_DIR` when `open()` is called and disclosing arbitrary files readable by the application process.",
+              "snippet": "@router.get(\"/download\")\ndef download_document(\n    filename: str = Query(\n        ...,\n        description=\"Filename of the stored receipt or contract document (e.g., INV-2026-001.txt)\",\n    ),\n    category: str = Query(\n        \"receipts\",\n        description=\"Document storage subfolder (receipts or contracts)\",\n    ),\n):\n    ...\n    target_file_path = os.path.join(\n        str(settings.DOCUMENTS_BASE_DIR), category, filename\n    )\n\n    if not os.path.exists(target_file_path):\n        raise HTTPException(\n            status_code=404,\n            detail=f\"Document '{filename}' not found in archive '{category}'\",\n        )\n\n    try:\n        with open(target_file_path, \"rb\") as file_handle:\n            file_bytes = file_handle.read()\n    ...\n    return Response(\n        content=file_bytes,\n        media_type=\"application/octet-stream\",\n        headers={\n            \"Content-Disposition\": f'attachment; filename=\"{os.path.basename(filename)}\"'\n        },\n    )",
+              "vuln_type": "IMPROPER LIMITATION OF A PATHNAME TO A RESTRICTED DIRECTORY ('PATH TRAVERSAL')",
+              "vuln_id": "CWE-22",
+              "fingerprint": "f2c14d159c4a3628",
+              "status": "OPEN",
+              "start_line": 10,
+              "end_line": 55
+            },
+            {
+              "finding_id": "a2187c36-4a62-5076-b3d5-8d85ef607a19",
+              "session_id": "ChBmZDM3OTA2NTI1YjJkOTdjEAgaAjhmKgRtYWlu",
+              "title": "Path Traversal in Report Template Preview Endpoint (`/api/v1/documents/template-preview`)",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/app/routers/documents.py",
+              "severity": "HIGH",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis: Path Traversal in `preview_report_template`\n\n1. **Source**: Untrusted user input enters via the JSON request body attribute `payload.template_path` (`TemplatePreviewRequest`) in the `POST /api/v1/documents/template-preview` endpoint (line 59).\n2. **Sanitization/Validation**: None. `payload.template_path` is interpolated directly into an f-string with `settings.TEMPLATES_DIR` at line 68 without path canonicalization (`Path.resolve()` / `os.path.realpath()`) or boundary verification (`Path.is_relative_to()`).\n3. **Sink**: At line 71, `open(raw_path, \"r\", encoding=\"utf-8\")` opens the unvalidated path and reads its entire contents (`template_file.read()` at line 72), returning the content in the `raw_template` field of the JSON response (lines 82-86).\n\n### Conceptual Exploit Payload\nAn unauthenticated attacker can send a POST request containing `../` traversal sequences in `template_path`:\n```http\nPOST /api/v1/documents/template-preview HTTP/1.1\nHost: target-app.local\nContent-Type: application/json\n\n{\n  \"template_path\": \"../../../../etc/passwd\",\n  \"company_header\": \"Acme Corp\"\n}\n```\nThe resulting `raw_path` resolves outside `settings.TEMPLATES_DIR`, causing `open()` to read and return the contents of `/etc/passwd` in the JSON response.",
+              "snippet": "@router.post(\"/template-preview\")\ndef preview_report_template(payload: TemplatePreviewRequest):\n    ...\n    raw_path = f\"{settings.TEMPLATES_DIR}/{payload.template_path}\"\n\n    try:\n        with open(raw_path, \"r\", encoding=\"utf-8\") as template_file:\n            template_content = template_file.read()\n    except FileNotFoundError:\n        raise HTTPException(\n            status_code=404, detail=\"Requested report template does not exist\"\n        )\n    except OSError as exc:\n        raise HTTPException(\n            status_code=500, detail=f\"Error reading template file: {exc}\"\n        )\n\n    return {\n        \"template_path\": payload.template_path,\n        \"company_header\": payload.company_header,\n        \"raw_template\": template_content,\n    }",
+              "vuln_type": "IMPROPER LIMITATION OF A PATHNAME TO A RESTRICTED DIRECTORY ('PATH TRAVERSAL')",
+              "vuln_id": "CWE-22",
+              "fingerprint": "38c7ec307b129be2",
+              "status": "OPEN",
+              "start_line": 58,
+              "end_line": 86
+            },
+            {
+              "finding_id": "a519b890-60e8-52a7-b4cd-ad47be1fab6f",
+              "session_id": "ChBmZThmZjhiNGE2OWI3YTE3EAgaAmIyKgRtYWlu",
+              "title": "Reflected Cross-Site Scripting (XSS) in Printable Report Preview Endpoint",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/app/routers/reports.py",
+              "severity": "MEDIUM",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis\nThe `/api/v1/reports/preview` endpoint in `generate_printable_report_preview` (lines 14-67) is vulnerable to Reflected Cross-Site Scripting (XSS).\n\n- **Source**: Untrusted user input enters via the `report_title`, `client_name`, and `custom_notes` HTTP query parameters defined at lines 16-27.\n- **Sanitization/Validation**: No HTML encoding (such as `html.escape()`) or sanitization is applied to any of the query parameters before interpolation.\n- **Sink**: The unescaped parameters are directly interpolated into an HTML document f-string (`html_document` at lines 37-65, specifically lines 41, 53, 57, and 61) and returned to the client with an `HTMLResponse` (`text/html` content type) at line 67.\n\n### Conceptual Exploit Payload\nAn attacker can craft a malicious link containing JavaScript in any of the query parameters:\n```http\nGET /api/v1/reports/preview?report_title=%3Cscript%3Ealert(document.domain)%3C/script%3E\u0026client_name=%3Cimg%20src%3Dx%20onerror%3Dalert(1)%3E HTTP/1.1\nHost: localhost:8000\n```\nWhen a victim visits this URL, the unescaped `\u003cscript\u003ealert(document.domain)\u003c/script\u003e` payload is rendered directly inside the HTML response (`\u003ctitle\u003e` and `\u003ch1\u003e` tags) and executed in the context of the victim's browser session.",
+              "snippet": "@router.get(\"/preview\", response_class=HTMLResponse)\ndef generate_printable_report_preview(\n    report_title: str = Query(\n        \"Q1 Executive Billing Statement\",\n        description=\"Title displayed on the printable HTML report header\",\n    ),\n    client_name: str = Query(\n        \"Acme Global Corp\",\n        description=\"Client organization name displayed on the report\",\n    ),\n    custom_notes: str = Query(\n        \"All payments settled within Net-30 terms.\",\n        description=\"Custom analyst commentary or HTML notes section\",\n    ),\n):\n...\n    html_document = f\"\"\"\u003c!DOCTYPE html\u003e\n...\n    \u003ctitle\u003eReport Preview - {report_title}\u003c/title\u003e\n...\n            \u003ch1\u003e{report_title}\u003c/h1\u003e\n...\n            Prepared for client organization: \u003cstrong\u003e{client_name}\u003c/strong\u003e\n...\n            \u003cdiv\u003e{custom_notes}\u003c/div\u003e\n    \u003c/div\u003e\n\u003c/body\u003e\n\u003c/html\u003e\"\"\"\n\n    return HTMLResponse(content=html_document, status_code=200)",
+              "vuln_type": "IMPROPER NEUTRALIZATION OF INPUT DURING WEB PAGE GENERATION ('CROSS-SITE SCRIPTING')",
+              "vuln_id": "CWE-79",
+              "fingerprint": "68e23b44eb730a14",
+              "status": "OPEN",
+              "start_line": 14,
+              "end_line": 67
             }
           ]
           EOF_FINDINGS
@@ -546,10 +722,39 @@ jobs:
             }
           }')
 
-          RESPONSE=$(curl -s "$WIZ_API_URL" \
-            -H "Authorization: Bearer $ACCESS_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "$QUERY_PAYLOAD")
+          MAX_RETRIES=8
+          ATTEMPT=1
+          while true; do
+            RESPONSE=$(curl -s "$WIZ_API_URL" \
+              -H "Authorization: Bearer $ACCESS_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$QUERY_PAYLOAD")
+
+            if echo "$RESPONSE" | jq -e 'any(.errors[]?; .extensions.code == "RATE_LIMIT_EXCEEDED" or (.message // "" | test("rate limit"; "i")))' >/dev/null 2>&1; then
+              if [ "$ATTEMPT" -ge "$MAX_RETRIES" ]; then
+                echo "Error: Wiz API rate limit exceeded after $MAX_RETRIES attempts."
+                echo "$RESPONSE" | jq .
+                exit 1
+              fi
+              SLEEP_SEC=$(echo "$RESPONSE" | jq -r --argjson attempt "$ATTEMPT" '
+                ([.errors[]? | select(.extensions.code == "RATE_LIMIT_EXCEEDED" or (.message // "" | test("rate limit"; "i"))) | .extensions][0] // {}) as $ext
+                | (if ($ext.retryAfterNS // null) != null then
+                    (($ext.retryAfterNS | tonumber) / 1000000000)
+                  elif ($ext.reset // null) != null then
+                    ((($ext.reset | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) - now) | if . > 0 then . else 0 end)
+                  else
+                    1
+                  end)
+                | (. + (0.25 * $attempt))
+                | if . < 0.25 then 0.25 else . end
+              ')
+              echo "Rate limit exceeded querying repository (attempt $ATTEMPT/$MAX_RETRIES). Retrying after ${SLEEP_SEC}s..."
+              sleep "${SLEEP_SEC:-1}"
+              ATTEMPT=$((ATTEMPT + 1))
+              continue
+            fi
+            break
+          done
 
           echo "$RESPONSE" | jq .
           RESOURCE_TYPE=$(echo "$RESPONSE" | jq -r '.data.versionControlResources.nodes[0].type')
@@ -621,17 +826,48 @@ jobs:
                   out_f.write(json.dumps(wiz_output, indent=2))
           EOF
 
+          MAX_RETRIES=10
           for payload in wiz-payloads/payload-*.json; do
             echo "Uploading finding payload: $payload"
-            FINDING_RESP=$(curl -s "$WIZ_API_URL" \
-              -H "Authorization: Bearer $ACCESS_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d @"$payload")
-            echo "$FINDING_RESP" | jq .
+            ATTEMPT=1
+            while true; do
+              FINDING_RESP=$(curl -s "$WIZ_API_URL" \
+                -H "Authorization: Bearer $ACCESS_TOKEN" \
+                -H "Content-Type: application/json" \
+                -d @"$payload")
 
-            ERRORS=$(echo "$FINDING_RESP" | jq -r '.errors // empty')
-            if [ -n "$ERRORS" ]; then
-              echo "Error creating penetration test finding in Wiz for $payload"
-              exit 1
-            fi
+              if echo "$FINDING_RESP" | jq -e 'any(.errors[]?; .extensions.code == "RATE_LIMIT_EXCEEDED" or (.message // "" | test("rate limit"; "i")))' >/dev/null 2>&1; then
+                if [ "$ATTEMPT" -ge "$MAX_RETRIES" ]; then
+                  echo "Error: Wiz API rate limit exceeded after $MAX_RETRIES attempts for $payload"
+                  echo "$FINDING_RESP" | jq .
+                  exit 1
+                fi
+                SLEEP_SEC=$(echo "$FINDING_RESP" | jq -r --argjson attempt "$ATTEMPT" '
+                  ([.errors[]? | select(.extensions.code == "RATE_LIMIT_EXCEEDED" or (.message // "" | test("rate limit"; "i"))) | .extensions][0] // {}) as $ext
+                  | (if ($ext.retryAfterNS // null) != null then
+                      (($ext.retryAfterNS | tonumber) / 1000000000)
+                    elif ($ext.reset // null) != null then
+                      ((($ext.reset | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) - now) | if . > 0 then . else 0 end)
+                    else
+                      1
+                    end)
+                  | (. + (0.25 * $attempt))
+                  | if . < 0.25 then 0.25 else . end
+                ')
+                echo "Rate limit exceeded for $payload (attempt $ATTEMPT/$MAX_RETRIES). Retrying after ${SLEEP_SEC}s..."
+                sleep "${SLEEP_SEC:-1}"
+                ATTEMPT=$((ATTEMPT + 1))
+                continue
+              fi
+
+              echo "$FINDING_RESP" | jq .
+
+              ERRORS=$(echo "$FINDING_RESP" | jq -r '.errors // empty')
+              if [ -n "$ERRORS" ]; then
+                echo "Error creating penetration test finding in Wiz for $payload"
+                exit 1
+              fi
+              break
+            done
           done
+
