@@ -514,7 +514,7 @@ jobs:
               "first": 5,
               "filterBy": {
                 "search": $search,
-                "type": "REPOSITORY_BRANCH"
+                "type": "REPOSITORY"
               }
             }
           }')
