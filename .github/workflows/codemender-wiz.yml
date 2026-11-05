@@ -1,14 +1,3 @@
-# on:
-#  secrets:
-#       WIF_PROVIDER:
-#         required: true
-#       WIF_SERVICE_ACCOUNT:
-#         required: true
-#       WIZ_CLIENT_ID:
-#         required: true
-#       WIZ_CLIENT_SECRET:
-#         required: true
-
 name: CodeMender Deep Scan to Wiz
 on:
   workflow_call:
@@ -33,15 +22,21 @@ on:
         required: false
         default: "25"
         type: string
+      use_cached_findings:
+        description: "Skip CodeMender scan steps and use pre-generated findings to test Wiz upload"
+        required: false
+        default: true
+        type: boolean
+
     secrets:
-     WIF_PROVIDER:
-       required: true
-     WIF_SERVICE_ACCOUNT:
-       required: true
-     WIZ_CLIENT_ID:
-       required: true
-     WIZ_CLIENT_SECRET:
-       required: true
+      WIF_PROVIDER:
+        required: true
+      WIF_SERVICE_ACCOUNT:
+        required: true
+      WIZ_CLIENT_ID:
+        required: true
+      WIZ_CLIENT_SECRET:
+        required: true
 
 permissions:
   contents: read
@@ -60,6 +55,7 @@ env:
 jobs:
   calculate-shards:
     name: Calculate Dynamic Shard Count
+    if: ${{ !inputs.use_cached_findings }}
     runs-on: ubuntu-24.04
     outputs:
       total_shards: ${{ steps.calc.outputs.total_shards }}
@@ -148,12 +144,12 @@ jobs:
   deep-scan-shard:
     name: CodeMender Deep Scan (Shard ${{ matrix.shard }}/${{ needs.calculate-shards.outputs.total_shards }})
     needs: calculate-shards
-    if: needs.calculate-shards.outputs.total_files != '0'
+    if: ${{ !inputs.use_cached_findings && needs.calculate-shards.outputs.total_files != '0' }}
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJson(needs.calculate-shards.outputs.shards_matrix) }}
+        shard: ${{ fromJson(needs.calculate-shards.outputs.shards_matrix || '[1]') }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -362,16 +358,18 @@ jobs:
   aggregate-results:
     name: Aggregate CodeMender Results & Send to Wiz
     needs: [calculate-shards, deep-scan-shard]
-    if: always() && needs.calculate-shards.outputs.total_files != '0'
+    if: ${{ always() && (inputs.use_cached_findings || needs.calculate-shards.outputs.total_files != '0') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
+        if: ${{ !inputs.use_cached_findings }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
           persist-credentials: false
 
       - name: Authenticate to Google Cloud
+        if: ${{ !inputs.use_cached_findings }}
         uses: google-github-actions/auth@v2
         with:
           workload_identity_provider: ${{ secrets.wif_provider }}
@@ -380,6 +378,7 @@ jobs:
           export_environment_variables: true
 
       - name: Install CodeMender CLI
+        if: ${{ !inputs.use_cached_findings }}
         run: |
           curl -fsSL -o cm-linux-amd64.zip "$CM_DOWNLOAD_URL"
           unzip -q cm-linux-amd64.zip
@@ -390,6 +389,7 @@ jobs:
           cm init
 
       - name: Download All Shard Reports
+        if: ${{ !inputs.use_cached_findings }}
         uses: actions/download-artifact@v4
         with:
           pattern: codemender-report-shard-*
@@ -397,6 +397,7 @@ jobs:
           merge-multiple: true
 
       - name: Merge and Import Shard Findings
+        if: ${{ !inputs.use_cached_findings }}
         run: |
           shopt -s nullglob
           json_files=(shard-reports/codemender-results-shard-*.json)
@@ -479,6 +480,32 @@ jobs:
           cm report -f md > summary.md
           cat summary.md >> $GITHUB_STEP_SUMMARY
 
+      - name: Load Pre-Generated CodeMender Findings (Skip CodeMender Steps)
+        if: ${{ inputs.use_cached_findings }}
+        run: |
+          cat << 'EOF_FINDINGS' > merged-findings.json
+          [
+            {
+              "finding_id": "5bba6a1b-8c49-512c-80df-3adfcba96f2f",
+              "session_id": "ChA1ZGU4ZWNiNTIyNjJmNzQwEAgaAjI0KgRtYWlu",
+              "title": "Hardcoded Payment Gateway API Key and Webhook Signing Secret in Environment Variable Fallbacks",
+              "file_path": "/home/runner/work/cm-python-sample/cm-python-sample/secrets/payment_gateway_service.py",
+              "severity": "CRITICAL",
+              "confidence": 100,
+              "analysis": "### Vulnerability Analysis\n- **Source**: The module-level configuration variables `PAYMENT_GATEWAY_API_KEY` and `WEBHOOK_SIGNING_SECRET` initialized via `os.getenv()` (lines 35-43).\n- **Sanitization/Validation**: None. Hardcoded live/production secret values (`\"sk_live_51Oz729DummyGatewayProductionKeyABC9876543210xyz\"` and `\"whsec_9b2d8f4e1c3a7b5e8d0f2a4c6e8b0d2f_fake_test_secret\"`) are embedded directly in the source code as default fallback arguments to `os.getenv()`.\n- **Sink**: If the environment variables `PAYMENT_GATEWAY_API_KEY` or `WEBHOOK_SIGNING_SECRET` are unset in any deployment environment, the application silently defaults to using the hardcoded secrets, and anyone with read access to the source repository compromises the payment gateway API key and webhook signing secret.\n\n### Conceptual Exploit Payload\nAn attacker who gains access to the repository or deploys/communicates with an instance where `WEBHOOK_SIGNING_SECRET` is not explicitly set in the environment can authenticate forged webhook requests by supplying the hardcoded secret:\n```http\nPOST /webhook HTTP/1.1\nHost: target.example.com\nX-Webhook-Auth: whsec_9b2d8f4e1c3a7b5e8d0f2a4c6e8b0d2f_fake_test_secret\nContent-Type: application/json\n\n{\"event\": \"payment.settled\", \"transaction_id\": \"txn_12345\"}\n```",
+              "snippet": "PAYMENT_GATEWAY_API_KEY = os.getenv(\n    \"PAYMENT_GATEWAY_API_KEY\",\n    \"sk_live_51Oz729DummyGatewayProductionKeyABC9876543210xyz\"\n)\n\nWEBHOOK_SIGNING_SECRET = os.getenv(\n    \"WEBHOOK_SIGNING_SECRET\",\n    \"whsec_9b2d8f4e1c3a7b5e8d0f2a4c6e8b0d2f_fake_test_secret\"\n)",
+              "vuln_type": "USE OF HARD-CODED CREDENTIALS",
+              "vuln_id": "CWE-798",
+              "fingerprint": "1af04ededcf6ab1f",
+              "status": "OPEN",
+              "start_line": 35,
+              "end_line": 43
+            }
+          ]
+          EOF_FINDINGS
+          count=$(jq 'length' merged-findings.json)
+          echo "Loaded $count pre-generated findings into merged-findings.json"
+
       - name: Authenticate to Wiz and Resolve Repository Graph Entity
         id: wiz-repo
         env:
@@ -514,7 +541,7 @@ jobs:
               "first": 5,
               "filterBy": {
                 "search": $search,
-                "type": "REPOSITORY"
+                "type": "REPOSITORY_BRANCH"
               }
             }
           }')
@@ -526,8 +553,7 @@ jobs:
 
           echo "$RESPONSE" | jq .
           RESOURCE_TYPE=$(echo "$RESPONSE" | jq -r '.data.versionControlResources.nodes[0].type')
-          # REPO_ID=$(echo "$RESPONSE" | jq -r '.data.versionControlResources.nodes[0].repository.id')
-          REPO_ID=$(echo "$RESPONSE" | jq -r '.data.versionControlResources.nodes[0].repository.id // .data.versionControlResources.nodes[0].id')
+          REPO_ID=$(echo "$RESPONSE" | jq -r '.data.versionControlResources.nodes[0].id')
 
           if [ "$RESOURCE_TYPE" = "null" ] || [ "$REPO_ID" = "null" ] || [ -z "$RESOURCE_TYPE" ] || [ -z "$REPO_ID" ]; then
             echo "Error: Failed to extract repository details from the API response."
