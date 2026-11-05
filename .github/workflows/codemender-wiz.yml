@@ -613,7 +613,8 @@ jobs:
               wiz_output["variables"]["input"]["weaknesses"] = [input_finding.get("vuln_id", "")]
               wiz_output["variables"]["input"]["reporterId"] = "CodeMender"
               wiz_output["variables"]["input"]["reportedAt"] = now
-              wiz_output["variables"]["input"]["origin"] = "MANUAL"
+              wiz_output["variables"]["input"]["origin"] = "CODEMENDER"
+              wiz_output["variables"]["input"]["tags"] = [{"key": "source", "value": "codemender"}]
 
               payload_path = f"wiz-payloads/payload-{idx}.json"
               with open(payload_path, "w") as out_f:
