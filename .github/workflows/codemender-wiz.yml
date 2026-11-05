@@ -526,7 +526,8 @@ jobs:
 
           echo "$RESPONSE" | jq .
           RESOURCE_TYPE=$(echo "$RESPONSE" | jq -r '.data.versionControlResources.nodes[0].type')
-          REPO_ID=$(echo "$RESPONSE" | jq -r '.data.versionControlResources.nodes[0].repository.id')
+          # REPO_ID=$(echo "$RESPONSE" | jq -r '.data.versionControlResources.nodes[0].repository.id')
+          REPO_ID=$(echo "$RESPONSE" | jq -r '.data.versionControlResources.nodes[0].repository.id // .data.versionControlResources.nodes[0].id')
 
           if [ "$RESOURCE_TYPE" = "null" ] || [ "$REPO_ID" = "null" ] || [ -z "$RESOURCE_TYPE" ] || [ -z "$REPO_ID" ]; then
             echo "Error: Failed to extract repository details from the API response."
