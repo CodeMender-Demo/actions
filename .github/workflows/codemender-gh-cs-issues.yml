@@ -1,0 +1,767 @@
+name: CodeMender Deep Scan to GitHub Code Scanning
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: "CodeMender reasoning model"
+        required: false
+        default: "gemini-4-argon"
+        type: string
+      workers:
+        description: "Concurrent deep-scan workers per shard"
+        required: false
+        default: "10"
+        type: string
+      max_shards:
+        description: "Maximum number of parallel shards"
+        required: false
+        default: "10"
+        type: string
+      files_per_shard:
+        description: "Target minimum scannable files per shard before splitting"
+        required: false
+        default: "25"
+        type: string
+      use_cached_findings:
+        description: "Skip CodeMender scan steps and use pre-generated findings to test GitHub Code Scanning upload"
+        required: false
+        default: true
+        type: boolean
+
+    secrets:
+      WIF_PROVIDER:
+        required: true
+      WIF_SERVICE_ACCOUNT:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+  security-events: write
+
+env:
+  CM_DOWNLOAD_URL: https://artifactregistry.googleapis.com/download/v1/projects/cmoc-prod/locations/us/repositories/codemender-cli-production/files/cm%3Astable%3Acm-linux-amd64.zip:download?alt=media
+  CM_MODEL: ${{ inputs.model || 'gemini-4-argon' }}
+  CM_WORKERS: ${{ inputs.workers || '10' }}
+  MAX_SHARDS: ${{ inputs.max_shards || '10' }}
+  FILES_PER_SHARD: ${{ inputs.files_per_shard || '25' }}
+
+jobs:
+  calculate-shards:
+    name: Calculate Dynamic Shard Count
+    if: ${{ !inputs.use_cached_findings }}
+    runs-on: ubuntu-24.04
+    outputs:
+      total_shards: ${{ steps.calc.outputs.total_shards }}
+      shards_matrix: ${{ steps.calc.outputs.shards_matrix }}
+      total_files: ${{ steps.calc.outputs.total_files }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Determine optimal shard count
+        id: calc
+        shell: python
+        run: |
+          import json
+          import math
+          import os
+          from collections import defaultdict
+          from pathlib import Path
+
+          max_shards = max(1, int(os.environ.get("MAX_SHARDS", "10")))
+          files_per_shard = max(1, int(os.environ.get("FILES_PER_SHARD", "25")))
+
+          include_exts = {
+              ".py", ".java", ".go", ".js", ".jsx", ".mjs", ".cjs",
+              ".ts", ".tsx", ".c", ".cc", ".cpp", ".cxx", ".h",
+              ".hpp", ".cs", ".rs", ".kt", ".kts",
+              ".rb", ".php", ".sol", ".tf", ".hcl", ".aspx",
+              ".cshtml", ".vbhtml", ".vue", ".sql",
+              ".pkh", ".pkb", ".tsql", ".abap", ".acds", ".abdl", ".cls",
+              ".trigger", ".ipynb", ".pl", ".pm", ".sh", ".vb", ".vbp", ".frm", ".bas", ".cls-meta.xml", ".pls"
+          }
+          exclude_suffixes = (".min.js", ".generated.go", ".pb.go")
+          exclude_dirs = {
+              ".git", ".github", ".codemender", ".cm_project",
+              "node_modules", "vendor", "dist", "bin", "target", "obj", "build", ".gradle"
+          }
+
+          dir_groups = defaultdict(list)
+          total_files = 0
+          total_bytes = 0
+          for root, dirs, files in os.walk("."):
+              dirs[:] = sorted(d for d in dirs if d not in exclude_dirs and not d.startswith("."))
+              for fname in sorted(files):
+                  if fname.endswith(exclude_suffixes):
+                      continue
+                  ext = os.path.splitext(fname)[1].lower()
+                  if ext in include_exts:
+                      fpath = Path(root) / fname
+                      if not fpath.is_symlink():
+                          size = fpath.stat().st_size
+                          rel_dir = Path(root).as_posix()
+                          dir_groups[rel_dir].append((size, fpath.as_posix()))
+                          total_files += 1
+                          total_bytes += size
+
+          if total_files == 0:
+              total_shards = 0
+              shards_list = []
+          else:
+              target_shards = max(1, min(max_shards, math.ceil(total_files / files_per_shard)))
+              # Compute work units using the same grouping logic as the shard step
+              max_unit_files = max(1, total_files // (target_shards * 2)) if target_shards > 1 else total_files
+              num_units = 0
+              for rel_dir, flist in dir_groups.items():
+                  if len(flist) <= max_unit_files:
+                      num_units += 1
+                  else:
+                      num_units += len(flist)
+              total_shards = max(1, min(target_shards, num_units))
+              shards_list = list(range(1, total_shards + 1))
+
+          print(
+              f"Repository size: {total_files} scannable files ({total_bytes / 1024:.1f} KB) "
+              f"across {len(dir_groups)} directories -> using {total_shards} shard(s): {shards_list}"
+          )
+
+          github_output = os.environ["GITHUB_OUTPUT"]
+          with open(github_output, "a") as out:
+              out.write(f"total_files={total_files}\n")
+              out.write(f"total_shards={total_shards}\n")
+              out.write(f"shards_matrix={json.dumps(shards_list)}\n")
+
+  deep-scan-shard:
+    name: CodeMender Deep Scan (Shard ${{ matrix.shard }}/${{ needs.calculate-shards.outputs.total_shards }})
+    needs: calculate-shards
+    if: ${{ !inputs.use_cached_findings && needs.calculate-shards.outputs.total_files != '0' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJson(needs.calculate-shards.outputs.shards_matrix || '[1]') }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.wif_provider }}
+          service_account: ${{ secrets.wif_service_account }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Install CodeMender CLI
+        run: |
+          curl -fsSL -o cm-linux-amd64.zip "$CM_DOWNLOAD_URL"
+          unzip -q cm-linux-amd64.zip
+          chmod +x cm
+          sudo mv cm /usr/local/bin/cm
+          cm --version
+          # Initialize Workspace
+          cm init
+
+      - name: Update config.yaml with file types
+        shell: python
+        run: |
+          import os
+          import yaml
+
+          config_file = os.path.expanduser('~/.codemender/config.yaml')
+
+          # 1. Declare file types to add
+          extensions_list = [
+            ".aspx",
+            ".cshtml",
+            ".vbhtml",
+            ".php",
+            ".vue",
+            ".sql",
+            ".pkh",
+            ".pkb",
+            ".tsql",
+            ".abap",
+            ".acds",
+            ".abdl",
+            ".cls",
+            ".trigger",
+            ".ipynb",
+            ".pl",
+            ".pm",
+            ".sh",
+            ".vb",
+            ".vbp",
+            ".frm",
+            ".bas",
+            ".cls-meta.xml",
+            ".pls"
+          ]
+
+          # 2. Load existing config
+          if os.path.exists(config_file):
+              with open(config_file, 'r') as f:
+                  config = yaml.safe_load(f) or {}
+          else:
+              print("Config not found")
+              config = {}
+
+          # Ensure the list key exists (assuming the key is 'file_types')
+          list_key = 'include'
+          if list_key not in config['scan']['extensions'] or config['scan']['extensions'][list_key] is None:
+              config['scan']['extensions'][list_key] = []
+
+          # 3. Add new extensions
+          updated = False
+          for ext in extensions_list:
+            if ext not in config['scan']['extensions'][list_key]:
+                  config['scan']['extensions'][list_key].append(ext)
+                  updated = True
+
+          # 4. Write back if changes were made
+          if updated:
+              with open(config_file, 'w') as f:
+                  yaml.dump(config, f, default_flow_style=False)
+              print(f"Updated {config_file} with new extensions:")
+          else:
+              print("No new extensions found.")
+
+      - name: Print config.yaml
+        run: |
+          cat ~/.codemender/config.yaml
+
+      - name: Configure .cmignore for Shard ${{ matrix.shard }}/${{ needs.calculate-shards.outputs.total_shards }} (Keep All Files on Disk)
+        id: shard-config
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          TOTAL_SHARDS: ${{ needs.calculate-shards.outputs.total_shards }}
+        shell: python
+        run: |
+          import heapq
+          import os
+          from collections import defaultdict
+          from pathlib import Path
+          shard_idx = int(os.environ["SHARD_INDEX"]) - 1
+          total_shards = int(os.environ["TOTAL_SHARDS"])
+          include_exts = {
+              ".py", ".java", ".go", ".js", ".jsx", ".mjs", ".cjs",
+              ".ts", ".tsx", ".c", ".cc", ".cpp", ".cxx", ".h",
+              ".hpp", ".cs", ".rs", ".kt", ".kts",
+              ".rb", ".php", ".sol", ".tf", ".hcl", ".aspx",
+              ".cshtml", ".vbhtml", ".vue", ".sql",
+              ".pkh", ".pkb", ".tsql", ".abap", ".acds", ".abdl", ".cls",
+              ".trigger", ".ipynb", ".pl", ".pm", ".sh", ".vb", ".vbp", ".frm", ".bas", ".cls-meta.xml", ".pls"
+          }
+          exclude_suffixes = (".min.js", ".generated.go", ".pb.go")
+          exclude_dirs = {
+              ".git", ".github", ".codemender", ".cm_project",
+              "node_modules", "vendor", "dist", "bin", "target", "obj", "build", ".gradle"
+          }
+          # 1. Discover all scannable files and group them by leaf directory (package/module)
+          dir_groups = defaultdict(list)
+          total_files = 0
+          for root, dirs, files in os.walk("."):
+              dirs[:] = sorted(d for d in dirs if d not in exclude_dirs and not d.startswith("."))
+              for fname in sorted(files):
+                  if fname.endswith(exclude_suffixes):
+                      continue
+                  ext = os.path.splitext(fname)[1].lower()
+                  if ext in include_exts:
+                      fpath = Path(root) / fname
+                      if not fpath.is_symlink():
+                          rel_dir = Path(root).as_posix()
+                          dir_groups[rel_dir].append((fpath.stat().st_size, fpath.as_posix()))
+                          total_files += 1
+          # 2. Build work units: keep sibling files in the same leaf directory together
+          # for taint locality, unless a single directory holds > (total_files / total_shards)
+          # files (e.g., a flat repo), in which case split that directory into individual files.
+          max_unit_files = max(1, total_files // (total_shards * 2)) if total_shards > 1 else total_files
+          units = []  # Each unit: (file_count, total_bytes, sort_key, [file_paths])
+          for rel_dir, flist in dir_groups.items():
+              if len(flist) <= max_unit_files:
+                  u_bytes = sum(s for s, _ in flist)
+                  u_paths = [p for _, p in flist]
+                  units.append((len(flist), u_bytes, rel_dir, u_paths))
+              else:
+                  for size_bytes, fpath in flist:
+                      units.append((1, size_bytes, fpath, [fpath]))
+          # 3. Sort largest units first (by file count, then byte size, then path for determinism)
+          units.sort(key=lambda u: (-u[0], -u[1], u[2]))
+          # 4. Deal units into total_shards using a min-heap keyed by (file_count, total_bytes, shard_id)
+          heap = [(0, 0, i) for i in range(total_shards)]
+          heapq.heapify(heap)
+          kept_files = 0
+          kept_bytes = 0
+          ignored_paths = []
+          for u_count, u_bytes, _, u_paths in units:
+              count, tot_bytes, target_shard = heapq.heappop(heap)
+              if target_shard == shard_idx:
+                  kept_files += u_count
+                  kept_bytes += u_bytes
+              else:
+                  ignored_paths.extend(u_paths)
+              heapq.heappush(heap, (count + u_count, tot_bytes + u_bytes, target_shard))
+          # 5. Append non-shard file paths to .cmignore instead of deleting from disk
+          if ignored_paths:
+              existing_ignore = ""
+              if os.path.exists(".cmignore"):
+                  with open(".cmignore", "r") as f:
+                      existing_ignore = f.read().rstrip("\n") + "\n"
+              with open(".cmignore", "w") as f:
+                  if existing_ignore:
+                      f.write(existing_ignore)
+                  f.write(f"# Auto-generated exclusions for shard {shard_idx + 1}/{total_shards}\n")
+                  for p in sorted(ignored_paths):
+                      f.write(f"{p}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"kept_files={kept_files}\n")
+          print(
+              f"Shard {shard_idx + 1}/{total_shards} configured via .cmignore: "
+              f"scanning {kept_files}/{total_files} files ({kept_bytes / 1024:.1f} KB), "
+              f"ignoring {len(ignored_paths)} files (all {total_files} files remain on disk)."
+          )
+
+      - name: Run CodeMender Deep Scan (Shard ${{ matrix.shard }}/${{ needs.calculate-shards.outputs.total_shards }})
+        if: steps.shard-config.outputs.kept_files != '0'
+        run: |
+          cm find . \
+            --deep \
+            --deep-workers="$CM_WORKERS" \
+            --model="$CM_MODEL" \
+            --sandbox=false
+          cm report -f md > "codemender-results-shard-${{ matrix.shard }}.md"
+          cm report -f json > "codemender-results-shard-${{ matrix.shard }}.json"
+
+      - name: Upload Shard Report Artifact
+        if: always() && steps.shard-config.outputs.kept_files != '0'
+        uses: actions/upload-artifact@v4
+        with:
+          name: codemender-report-shard-${{ matrix.shard }}
+          path: |
+            codemender-results-shard-${{ matrix.shard }}.md
+            codemender-results-shard-${{ matrix.shard }}.json
+          retention-days: 7
+
+  aggregate-results:
+    name: Aggregate CodeMender Results & Upload to GitHub Code Scanning
+    needs: [calculate-shards, deep-scan-shard]
+    if: ${{ always() && (inputs.use_cached_findings || needs.calculate-shards.outputs.total_files != '0') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Authenticate to Google Cloud
+        if: ${{ !inputs.use_cached_findings }}
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.wif_provider }}
+          service_account: ${{ secrets.wif_service_account }}
+          create_credentials_file: true
+          export_environment_variables: true
+
+      - name: Install CodeMender CLI
+        if: ${{ !inputs.use_cached_findings }}
+        run: |
+          curl -fsSL -o cm-linux-amd64.zip "$CM_DOWNLOAD_URL"
+          unzip -q cm-linux-amd64.zip
+          chmod +x cm
+          sudo mv cm /usr/local/bin/cm
+          cm --version
+          # Initialize Workspace
+          cm init
+
+      - name: Download All Shard Reports
+        if: ${{ !inputs.use_cached_findings }}
+        uses: actions/download-artifact@v4
+        with:
+          pattern: codemender-report-shard-*
+          path: shard-reports
+          merge-multiple: true
+
+      - name: Merge and Import Shard Findings
+        if: ${{ !inputs.use_cached_findings }}
+        run: |
+          shopt -s nullglob
+          json_files=(shard-reports/codemender-results-shard-*.json)
+
+          if [ "${#json_files[@]}" -eq 0 ]; then
+            echo "[]" > merged-findings.json
+          else
+            jq -s '
+              [
+                .[]
+                | if type == "array" then .[]
+                  elif type == "object" and (.findings | type == "array") then .findings[]
+                  else empty
+                  end
+              ]
+              | unique_by(.finding_id, .file_path, .start_line, .title)
+              | map(. + {
+                  finding_id: .finding_id,
+                  file_path: .file_path,
+                  title: .title,
+                  severity: .severity,
+                  vuln_type: .vuln_type,
+                  vuln_id: .vuln_id,
+                  confidence: .confidence,
+                  analysis: .analysis,
+                  snippet: .snippet,
+                  start_line: .start_line,
+                  end_line: .end_line
+                })
+            ' "${json_files[@]}" > merged-findings.json
+          fi
+
+          cat merged-findings.json
+
+          count=$(jq 'length' merged-findings.json)
+          echo "Total merged findings across all shards: $count"
+
+          if [ "$count" -gt 0 ]; then
+            cm report import -f merged-findings.json
+          fi
+
+          python3 - << 'EOF'
+          import json, os, sqlite3
+          cm_home = os.path.expanduser(os.environ.get("CM_HOME", "~/.codemender"))
+          db_path = os.path.join(cm_home, "state.db")
+          with open("merged-findings.json") as f:
+              findings = json.load(f)
+          conn = sqlite3.connect(db_path)
+          existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(findings)")}
+          for item in findings:
+              candidate_updates = {
+                  "confidence": int(item.get("confidence", 100)),
+                  "confidence_level": "HIGH",
+                  "analysis": item.get("analysis", ""),
+                  "snippet": item.get("snippet", ""),
+                  "vuln_type": item.get("vuln_type", ""),
+                  "vuln_id": item.get("vuln_id", ""),
+                  "fingerprint": item.get("fingerprint", ""),
+                  "start_line": int(item.get("start_line") or item.get("line") or 1),
+                  "end_line": int(item.get("end_line") or item.get("start_line") or item.get("line") or 1),
+              }
+              # Only update columns present in the current CLI schema
+              updates = {k: v for k, v in candidate_updates.items() if k in existing_cols and v != ""}
+              set_clause = ", ".join(f"{k} = ?" for k in updates)
+              fp = item["file_path"]
+              start_line = int(item.get("start_line") or item.get("line") or 1)
+              # Match even if `cm report import` normalized absolute paths to repo-relative paths
+              conn.execute(
+                  f"""UPDATE findings
+                      SET {set_clause}
+                      WHERE title = ?
+                        AND start_line = ?
+                        AND (file_path = ? OR ? LIKE '%' || file_path OR file_path LIKE '%' || ?)""",
+                  [*updates.values(), item["title"], start_line, fp, fp, fp],
+              )
+          conn.commit()
+          conn.close()
+          EOF
+
+          cm report -f md > summary.md
+          cat summary.md >> $GITHUB_STEP_SUMMARY
+          cm report -f sarif > findings.sarif
+
+      - name: Load Pre-Generated CodeMender Findings (Skip CodeMender Steps)
+        if: ${{ inputs.use_cached_findings }}
+        run: |
+          cat << 'EOF_SARIF' > findings.sarif
+          {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+              {
+                "tool": {
+                  "driver": {
+                    "name": "CodeMender",
+                    "version": "dev",
+                    "rules": [
+                      {
+                        "id": "SQL INJECTION",
+                        "shortDescription": {
+                          "text": "SQL INJECTION"
+                        },
+                        "properties": {
+                          "security-severity": "7.5"
+                        }
+                      },
+                      {
+                        "id": "PATH TRAVERSAL",
+                        "shortDescription": {
+                          "text": "PATH TRAVERSAL"
+                        },
+                        "properties": {
+                          "security-severity": "7.5"
+                        }
+                      },
+                      {
+                        "id": "SERVER-SIDE REQUEST FORGERY (SSRF)",
+                        "shortDescription": {
+                          "text": "SERVER-SIDE REQUEST FORGERY (SSRF)"
+                        },
+                        "properties": {
+                          "security-severity": "7.5"
+                        }
+                      },
+                      {
+                        "id": "CROSS-SITE SCRIPTING (XSS)",
+                        "shortDescription": {
+                          "text": "CROSS-SITE SCRIPTING (XSS)"
+                        },
+                        "properties": {
+                          "security-severity": "7.5"
+                        }
+                      }
+                    ]
+                  }
+                },
+                "results": [
+                  {
+                    "ruleId": "SQL INJECTION",
+                    "level": "error",
+                    "message": {
+                      "text": "SQL Injection in search_invoices Endpoint\n\nIn app/routers/invoices.py, the search_invoices endpoint dynamically concatenates untrusted query parameters (customer_name, status, sort_by) directly into raw SQL query strings using Python f-strings without sanitization or query parameterization. The constructed query is executed directly against the SQLite database via cursor.execute(base_query). An attacker can inject arbitrary SQL statements, such as UNION SELECT payloads, to bypass filters and extract sensitive database records (e.g. from the audit_logs table). Verified with standalone working exploit.",
+                      "markdown": "**SQL Injection in search\\_invoices Endpoint**\n\nIn app/routers/invoices.py, the search_invoices endpoint dynamically concatenates untrusted query parameters (customer_name, status, sort_by) directly into raw SQL query strings using Python f-strings without sanitization or query parameterization. The constructed query is executed directly against the SQLite database via cursor.execute(base_query). An attacker can inject arbitrary SQL statements, such as UNION SELECT payloads, to bypass filters and extract sensitive database records (e.g. from the audit_logs table). Verified with standalone working exploit.\n\n```\n@router.get(\"/search\", response_model=List[InvoiceResponse])\ndef search_invoices(\n    request: Request,\n    customer_name: str = Query(\n        \"\", description=\"Filter invoices by customer name substring\"\n    ),\n    status: Optional[str] = Query(\n        None, description=\"Filter by invoice status (e.g., PAID, PENDING, OVERDUE)\"\n    ),\n    sort_by: str = Query(\n        \"created_at\", description=\"Column name to sort results by\"\n    ),\n    db: sqlite3.Connection = Depends(get_db),\n):\n    cursor = db.cursor()\n\n    # Vulnerable raw SQL string construction\n    base_query = (\n        f\"SELECT id, invoice_number, customer_name, billing_email, amount, currency, status, notes, created_at \"\n        f\"FROM invoices WHERE customer_name LIKE '%{customer_name}%'\"\n    )\n\n    if status:\n        base_query += f\" AND status = '{status}'\"\n\n    base_query += f\" ORDER BY {sort_by} DESC\"\n\n    try:\n        cursor.execute(base_query)\n        rows = cursor.fetchall()\n```"
+                    },
+                    "locations": [
+                      {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/routers/invoices.py",
+                            "uriBaseId": "%SRCROOT%"
+                          },
+                          "region": {
+                            "startLine": 13,
+                            "endLine": 63,
+                            "snippet": {
+                              "text": "@router.get(\"/search\", response_model=List[InvoiceResponse])\ndef search_invoices(\n    request: Request,\n    customer_name: str = Query(\n        \"\", description=\"Filter invoices by customer name substring\"\n    ),\n    status: Optional[str] = Query(\n        None, description=\"Filter by invoice status (e.g., PAID, PENDING, OVERDUE)\"\n    ),\n    sort_by: str = Query(\n        \"created_at\", description=\"Column name to sort results by\"\n    ),\n    db: sqlite3.Connection = Depends(get_db),\n):\n    cursor = db.cursor()\n\n    # Vulnerable raw SQL string construction\n    base_query = (\n        f\"SELECT id, invoice_number, customer_name, billing_email, amount, currency, status, notes, created_at \"\n        f\"FROM invoices WHERE customer_name LIKE '%{customer_name}%'\"\n    )\n\n    if status:\n        base_query += f\" AND status = '{status}'\"\n\n    base_query += f\" ORDER BY {sort_by} DESC\"\n\n    try:\n        cursor.execute(base_query)\n        rows = cursor.fetchall()"
+                            }
+                          }
+                        }
+                      }
+                    ],
+                    "properties": {
+                      "security-severity": "7.5"
+                    }
+                  },
+                  {
+                    "ruleId": "SQL INJECTION",
+                    "level": "error",
+                    "message": {
+                      "text": "SQL Injection in lookup_invoice_by_number Endpoint\n\nSource: Untrusted path parameter `invoice_number` passed to `GET /api/v1/invoices/lookup/{invoice_number}`.\nValidation: None. The value is interpolated directly into the SQL statement string.\nSink: `cursor.execute(query)` executes the raw SQL query.\nConceptual Exploit Payload:\n`GET /api/v1/invoices/lookup/'%20OR%201=1--`\nThis causes the database to return the first record or can be chained with UNION SELECT to extract unauthorized table contents.",
+                      "markdown": "**SQL Injection in lookup\\_invoice\\_by\\_number Endpoint**\n\nSource: Untrusted path parameter `invoice_number` passed to `GET /api/v1/invoices/lookup/{invoice_number}`.\nValidation: None. The value is interpolated directly into the SQL statement string.\nSink: `cursor.execute(query)` executes the raw SQL query.\nConceptual Exploit Payload:\n`GET /api/v1/invoices/lookup/'%20OR%201=1--`\nThis causes the database to return the first record or can be chained with UNION SELECT to extract unauthorized table contents.\n\n```\n@router.get(\"/lookup/{invoice_number}\")\ndef lookup_invoice_by_number(\n    invoice_number: str,\n    db: sqlite3.Connection = Depends(get_db),\n):\n    cursor = db.cursor()\n    query = f\"SELECT * FROM invoices WHERE invoice_number = '{invoice_number}'\"\n\n    try:\n        cursor.execute(query)\n        row = cursor.fetchone()\n```"
+                    },
+                    "locations": [
+                      {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/routers/invoices.py",
+                            "uriBaseId": "%SRCROOT%"
+                          },
+                          "region": {
+                            "startLine": 66,
+                            "endLine": 89,
+                            "snippet": {
+                              "text": "@router.get(\"/lookup/{invoice_number}\")\ndef lookup_invoice_by_number(\n    invoice_number: str,\n    db: sqlite3.Connection = Depends(get_db),\n):\n    cursor = db.cursor()\n    query = f\"SELECT * FROM invoices WHERE invoice_number = '{invoice_number}'\"\n\n    try:\n        cursor.execute(query)\n        row = cursor.fetchone()"
+                            }
+                          }
+                        }
+                      }
+                    ],
+                    "properties": {
+                      "security-severity": "7.5"
+                    }
+                  },
+                  {
+                    "ruleId": "PATH TRAVERSAL",
+                    "level": "error",
+                    "message": {
+                      "text": "Path Traversal in download_document Endpoint\n\nSource: Untrusted query parameters `filename` and `category` passed to `GET /api/v1/documents/download`.\nValidation: No canonicalization or boundary checking (e.g. `Path.resolve()` or `is_relative_to()`) is performed before opening the file.\nSink: `open(target_file_path, \"rb\")` reads file bytes from the traversed file path and returns them in the response.\nConceptual Exploit Payload:\n`GET /api/v1/documents/download?category=receipts\u0026filename=../../../../etc/passwd`\n`target_file_path` resolves to `/etc/passwd`, allowing an attacker to read arbitrary system and application files.",
+                      "markdown": "**Path Traversal in download\\_document Endpoint**\n\nSource: Untrusted query parameters `filename` and `category` passed to `GET /api/v1/documents/download`.\nValidation: No canonicalization or boundary checking (e.g. `Path.resolve()` or `is_relative_to()`) is performed before opening the file.\nSink: `open(target_file_path, \"rb\")` reads file bytes from the traversed file path and returns them in the response.\nConceptual Exploit Payload:\n`GET /api/v1/documents/download?category=receipts\u0026filename=../../../../etc/passwd`\n`target_file_path` resolves to `/etc/passwd`, allowing an attacker to read arbitrary system and application files.\n\n```\n@router.get(\"/download\")\ndef download_document(\n    filename: str = Query(\n        ...,\n        description=\"Filename of the stored receipt or contract document (e.g., INV-2026-001.txt)\",\n    ),\n    category: str = Query(\n        \"receipts\",\n        description=\"Document storage subfolder (receipts or contracts)\",\n    ),\n):\n    # Vulnerable path construction: no sanitization or containment check\n    target_file_path = os.path.join(\n        str(settings.DOCUMENTS_BASE_DIR), category, filename\n    )\n\n    if not os.path.exists(target_file_path):\n        raise HTTPException(\n            status_code=404,\n            detail=f\"Document '{filename}' not found in archive '{category}'\",\n        )\n\n    try:\n        with open(target_file_path, \"rb\") as file_handle:\n            file_bytes = file_handle.read()\n```"
+                    },
+                    "locations": [
+                      {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/routers/documents.py",
+                            "uriBaseId": "%SRCROOT%"
+                          },
+                          "region": {
+                            "startLine": 10,
+                            "endLine": 55,
+                            "snippet": {
+                              "text": "@router.get(\"/download\")\ndef download_document(\n    filename: str = Query(\n        ...,\n        description=\"Filename of the stored receipt or contract document (e.g., INV-2026-001.txt)\",\n    ),\n    category: str = Query(\n        \"receipts\",\n        description=\"Document storage subfolder (receipts or contracts)\",\n    ),\n):\n    # Vulnerable path construction: no sanitization or containment check\n    target_file_path = os.path.join(\n        str(settings.DOCUMENTS_BASE_DIR), category, filename\n    )\n\n    if not os.path.exists(target_file_path):\n        raise HTTPException(\n            status_code=404,\n            detail=f\"Document '{filename}' not found in archive '{category}'\",\n        )\n\n    try:\n        with open(target_file_path, \"rb\") as file_handle:\n            file_bytes = file_handle.read()"
+                            }
+                          }
+                        }
+                      }
+                    ],
+                    "properties": {
+                      "security-severity": "7.5"
+                    }
+                  },
+                  {
+                    "ruleId": "PATH TRAVERSAL",
+                    "level": "error",
+                    "message": {
+                      "text": "Path Traversal in preview_report_template Endpoint\n\nSource: Untrusted JSON request body field `payload.template_path` passed to `POST /api/v1/documents/template-preview`.\nValidation: None. The path is directly concatenated via string formatting (`f\"{settings.TEMPLATES_DIR}/{payload.template_path}\"`) without resolving or enforcing confinement to `settings.TEMPLATES_DIR`.\nSink: `open(raw_path, \"r\", encoding=\"utf-8\")` reads the requested file.\nConceptual Exploit Payload:\n`POST /api/v1/documents/template-preview`\nBody: `{\"template_path\": \"../../../../etc/passwd\"}`\nThe server opens and returns `/etc/passwd` inside the `raw_template` response field.",
+                      "markdown": "**Path Traversal in preview\\_report\\_template Endpoint**\n\nSource: Untrusted JSON request body field `payload.template_path` passed to `POST /api/v1/documents/template-preview`.\nValidation: None. The path is directly concatenated via string formatting (`f\"{settings.TEMPLATES_DIR}/{payload.template_path}\"`) without resolving or enforcing confinement to `settings.TEMPLATES_DIR`.\nSink: `open(raw_path, \"r\", encoding=\"utf-8\")` reads the requested file.\nConceptual Exploit Payload:\n`POST /api/v1/documents/template-preview`\nBody: `{\"template_path\": \"../../../../etc/passwd\"}`\nThe server opens and returns `/etc/passwd` inside the `raw_template` response field.\n\n```\n@router.post(\"/template-preview\")\ndef preview_report_template(payload: TemplatePreviewRequest):\n    raw_path = f\"{settings.TEMPLATES_DIR}/{payload.template_path}\"\n\n    try:\n        with open(raw_path, \"r\", encoding=\"utf-8\") as template_file:\n            template_content = template_file.read()\n    except FileNotFoundError:\n        raise HTTPException(\n            status_code=404, detail=\"Requested report template does not exist\"\n        )\n    except OSError as exc:\n        raise HTTPException(\n            status_code=500, detail=f\"Error reading template file: {exc}\"\n        )\n\n    return {\n        \"template_path\": payload.template_path,\n        \"company_header\": payload.company_header,\n        \"raw_template\": template_content,\n    }\n```"
+                    },
+                    "locations": [
+                      {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/routers/documents.py",
+                            "uriBaseId": "%SRCROOT%"
+                          },
+                          "region": {
+                            "startLine": 58,
+                            "endLine": 86,
+                            "snippet": {
+                              "text": "@router.post(\"/template-preview\")\ndef preview_report_template(payload: TemplatePreviewRequest):\n    raw_path = f\"{settings.TEMPLATES_DIR}/{payload.template_path}\"\n\n    try:\n        with open(raw_path, \"r\", encoding=\"utf-8\") as template_file:\n            template_content = template_file.read()\n    except FileNotFoundError:\n        raise HTTPException(\n            status_code=404, detail=\"Requested report template does not exist\"\n        )\n    except OSError as exc:\n        raise HTTPException(\n            status_code=500, detail=f\"Error reading template file: {exc}\"\n        )\n\n    return {\n        \"template_path\": payload.template_path,\n        \"company_header\": payload.company_header,\n        \"raw_template\": template_content,\n    }"
+                            }
+                          }
+                        }
+                      }
+                    ],
+                    "properties": {
+                      "security-severity": "7.5"
+                    }
+                  },
+                  {
+                    "ruleId": "SERVER-SIDE REQUEST FORGERY (SSRF)",
+                    "level": "error",
+                    "message": {
+                      "text": "Server-Side Request Forgery in test_webhook_delivery Endpoint\n\nSource: Untrusted JSON payload field `payload.target_url` passed to `POST /api/v1/integrations/webhook-test`.\nValidation: None. No URL scheme validation or IP address filtering (e.g. blocking loopback, link-local metadata like 169.254.169.254, or RFC 1918 private ranges) is performed.\nSink: `requests.post(payload.target_url, json=test_body, ...)` makes an outbound HTTP request, and the upstream response text is returned in the HTTP response.\nConceptual Exploit Payload:\n`POST /api/v1/integrations/webhook-test`\nBody: `{\"target_url\": \"http://169.254.169.254/computeMetadata/v1/\", \"custom_headers\": {\"Metadata-Flavor\": \"Google\"}}`\nThis makes the server send a request to internal/cloud metadata or internal network services and reflects the response back to the attacker.",
+                      "markdown": "**Server-Side Request Forgery in test\\_webhook\\_delivery Endpoint**\n\nSource: Untrusted JSON payload field `payload.target_url` passed to `POST /api/v1/integrations/webhook-test`.\nValidation: None. No URL scheme validation or IP address filtering (e.g. blocking loopback, link-local metadata like 169.254.169.254, or RFC 1918 private ranges) is performed.\nSink: `requests.post(payload.target_url, json=test_body, ...)` makes an outbound HTTP request, and the upstream response text is returned in the HTTP response.\nConceptual Exploit Payload:\n`POST /api/v1/integrations/webhook-test`\nBody: `{\"target_url\": \"http://169.254.169.254/computeMetadata/v1/\", \"custom_headers\": {\"Metadata-Flavor\": \"Google\"}}`\nThis makes the server send a request to internal/cloud metadata or internal network services and reflects the response back to the attacker.\n\n```\n@router.post(\"/webhook-test\")\ndef test_webhook_delivery(payload: WebhookTestRequest):\n    test_body = {\n        \\\"event\\\": payload.event_type,\n        \\\"source\\\": \\\"FinPulse-Enterprise-Gateway\\\",\n        \\\"test_mode\\\": True,\n        \\\"sample_invoice_id\\\": \\\"INV-2026-001\\\",\n    }\n\n    headers = {\\\"Content-Type\\\": \\\"application/json\\\", \\\"User-Agent\\\": \\\"FinPulse-Webhook/1.2\\\"}\n    if payload.custom_headers:\n        headers.update(payload.custom_headers)\n\n    try:\n        # Vulnerable outbound request to arbitrary user-specified URL\n        response = requests.post(\n            payload.target_url,\n            json=test_body,\n            headers=headers,\n            timeout=settings.WEBHOOK_TIMEOUT_SECONDS,\n            allow_redirects=True,\n        )\n```"
+                    },
+                    "locations": [
+                      {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/routers/integrations.py",
+                            "uriBaseId": "%SRCROOT%"
+                          },
+                          "region": {
+                            "startLine": 13,
+                            "endLine": 56,
+                            "snippet": {
+                              "text": "@router.post(\"/webhook-test\")\ndef test_webhook_delivery(payload: WebhookTestRequest):\n    test_body = {\n        \\\"event\\\": payload.event_type,\n        \\\"source\\\": \\\"FinPulse-Enterprise-Gateway\\\",\n        \\\"test_mode\\\": True,\n        \\\"sample_invoice_id\\\": \\\"INV-2026-001\\\",\n    }\n\n    headers = {\\\"Content-Type\\\": \\\"application/json\\\", \\\"User-Agent\\\": \\\"FinPulse-Webhook/1.2\\\"}\n    if payload.custom_headers:\n        headers.update(payload.custom_headers)\n\n    try:\n        # Vulnerable outbound request to arbitrary user-specified URL\n        response = requests.post(\n            payload.target_url,\n            json=test_body,\n            headers=headers,\n            timeout=settings.WEBHOOK_TIMEOUT_SECONDS,\n            allow_redirects=True,\n        )"
+                            }
+                          }
+                        }
+                      }
+                    ],
+                    "properties": {
+                      "security-severity": "7.5"
+                    }
+                  },
+                  {
+                    "ruleId": "SERVER-SIDE REQUEST FORGERY (SSRF)",
+                    "level": "error",
+                    "message": {
+                      "text": "Server-Side Request Forgery in fetch_partner_exchange_rates Endpoint\n\nSource: Untrusted query parameter `provider_url` passed to `GET /api/v1/integrations/fetch-exchange-rates`.\nValidation: None. No protocol scheme verification (allowing `file://`, `gopher://`, etc.) or host allowlisting is applied.\nSink: `urllib.request.urlopen(req, ...)` fetches the requested URL.\nConceptual Exploit Payload:\n`GET /api/v1/integrations/fetch-exchange-rates?provider_url=file:///etc/passwd`\n`urllib.request.urlopen` fetches local file contents via the `file://` URL scheme or accesses internal services via `http://127.0.0.1:8000/`.",
+                      "markdown": "**Server-Side Request Forgery in fetch\\_partner\\_exchange\\_rates Endpoint**\n\nSource: Untrusted query parameter `provider_url` passed to `GET /api/v1/integrations/fetch-exchange-rates`.\nValidation: None. No protocol scheme verification (allowing `file://`, `gopher://`, etc.) or host allowlisting is applied.\nSink: `urllib.request.urlopen(req, ...)` fetches the requested URL.\nConceptual Exploit Payload:\n`GET /api/v1/integrations/fetch-exchange-rates?provider_url=file:///etc/passwd`\n`urllib.request.urlopen` fetches local file contents via the `file://` URL scheme or accesses internal services via `http://127.0.0.1:8000/`.\n\n```\n@router.get(\"/fetch-exchange-rates\")\ndef fetch_partner_exchange_rates(\n    provider_url: str = Query(\n        default=settings.DEFAULT_EXCHANGE_RATE_URL,\n        description=\"Remote JSON feed URL for currency exchange rates\",\n    ),\n):\n    try:\n        req = urllib.request.Request(\n            provider_url,\n            headers={\"User-Agent\": \"FinPulse-FX-Sync/1.2\"},\n        )\n        with urllib.request.urlopen(\n            req, timeout=settings.WEBHOOK_TIMEOUT_SECONDS\n        ) as resp:\n            raw_data = resp.read().decode(\"utf-8\", errors=\"replace\")\n```"
+                    },
+                    "locations": [
+                      {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/routers/integrations.py",
+                            "uriBaseId": "%SRCROOT%"
+                          },
+                          "region": {
+                            "startLine": 59,
+                            "endLine": 93,
+                            "snippet": {
+                              "text": "@router.get(\"/fetch-exchange-rates\")\ndef fetch_partner_exchange_rates(\n    provider_url: str = Query(\n        default=settings.DEFAULT_EXCHANGE_RATE_URL,\n        description=\"Remote JSON feed URL for currency exchange rates\",\n    ),\n):\n    try:\n        req = urllib.request.Request(\n            provider_url,\n            headers={\"User-Agent\": \"FinPulse-FX-Sync/1.2\"},\n        )\n        with urllib.request.urlopen(\n            req, timeout=settings.WEBHOOK_TIMEOUT_SECONDS\n        ) as resp:\n            raw_data = resp.read().decode(\"utf-8\", errors=\"replace\")"
+                            }
+                          }
+                        }
+                      }
+                    ],
+                    "properties": {
+                      "security-severity": "7.5"
+                    }
+                  },
+                  {
+                    "ruleId": "CROSS-SITE SCRIPTING (XSS)",
+                    "level": "error",
+                    "message": {
+                      "text": "Stored and Reflected Cross-Site Scripting in view_security_audit_feed Endpoint\n\nSource: Untrusted query parameter `filter_banner` in `GET /api/v1/reports/audit-feed` and stored database audit log attributes (`actor`, `details`) populated from unvalidated inputs during invoice creation (`POST /api/v1/invoices`).\nValidation: No HTML entity encoding is performed either prior to storage or when rendering the HTML table.\nSink: `render_audit_table_html()` interpolates the values directly into HTML returned via `HTMLResponse(content=dashboard_html, status_code=200)`.\nConceptual Exploit Payload:\nStored XSS:\n`POST /api/v1/invoices` with JSON body:\n`{\"invoice_number\": \"INV-XSS-1\", \"customer_name\": \"\u003cscript\u003ealert('Stored XSS')\u003c/script\u003e\", \"billing_email\": \"xss@example.com\", \"amount\": 100.0}`\nReflected XSS:\n`GET /api/v1/reports/audit-feed?filter_banner=%3Cscript%3Ealert(%27Reflected%20XSS%27)%3C/script%3E`\nWhen viewing the audit feed, the malicious JavaScript executes in the victim's browser.",
+                      "markdown": "**Stored and Reflected Cross-Site Scripting in view\\_security\\_audit\\_feed Endpoint**\n\nSource: Untrusted query parameter `filter_banner` in `GET /api/v1/reports/audit-feed` and stored database audit log attributes (`actor`, `details`) populated from unvalidated inputs during invoice creation (`POST /api/v1/invoices`).\nValidation: No HTML entity encoding is performed either prior to storage or when rendering the HTML table.\nSink: `render_audit_table_html()` interpolates the values directly into HTML returned via `HTMLResponse(content=dashboard_html, status_code=200)`.\nConceptual Exploit Payload:\nStored XSS:\n`POST /api/v1/invoices` with JSON body:\n`{\"invoice_number\": \"INV-XSS-1\", \"customer_name\": \"\u003cscript\u003ealert('Stored XSS')\u003c/script\u003e\", \"billing_email\": \"xss@example.com\", \"amount\": 100.0}`\nReflected XSS:\n`GET /api/v1/reports/audit-feed?filter_banner=%3Cscript%3Ealert(%27Reflected%20XSS%27)%3C/script%3E`\nWhen viewing the audit feed, the malicious JavaScript executes in the victim's browser.\n\n```\n@router.get(\"/audit-feed\", response_class=HTMLResponse)\ndef view_security_audit_feed(\n    filter_banner: str = Query(\n        \"\",\n        description=\"Optional filter banner label displayed at the top of the dashboard\",\n    ),\n    limit: int = Query(25, ge=1, le=100),\n    db: sqlite3.Connection = Depends(get_db),\n):\n    logs = fetch_recent_audit_logs(db, limit=limit)\n    dashboard_html = render_audit_table_html(logs=logs, filter_banner=filter_banner)\n    return HTMLResponse(content=dashboard_html, status_code=200)\n```"
+                    },
+                    "locations": [
+                      {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/routers/reports.py",
+                            "uriBaseId": "%SRCROOT%"
+                          },
+                          "region": {
+                            "startLine": 70,
+                            "endLine": 88,
+                            "snippet": {
+                              "text": "@router.get(\"/audit-feed\", response_class=HTMLResponse)\ndef view_security_audit_feed(\n    filter_banner: str = Query(\n        \"\",\n        description=\"Optional filter banner label displayed at the top of the dashboard\",\n    ),\n    limit: int = Query(25, ge=1, le=100),\n    db: sqlite3.Connection = Depends(get_db),\n):\n    logs = fetch_recent_audit_logs(db, limit=limit)\n    dashboard_html = render_audit_table_html(logs=logs, filter_banner=filter_banner)\n    return HTMLResponse(content=dashboard_html, status_code=200)"
+                            }
+                          }
+                        }
+                      }
+                    ],
+                    "properties": {
+                      "security-severity": "7.5"
+                    }
+                  },
+                  {
+                    "ruleId": "CROSS-SITE SCRIPTING (XSS)",
+                    "level": "warning",
+                    "message": {
+                      "text": "Reflected Cross-Site Scripting in generate_printable_report_preview Endpoint\n\nSource: Untrusted query parameters `report_title`, `client_name`, and `custom_notes` passed to `GET /api/v1/reports/preview`.\nValidation: None. The values are interpolated into an HTML string without escaping via `html.escape()`.\nSink: `return HTMLResponse(content=html_document, status_code=200)` renders the raw HTML in the user's browser.\nConceptual Exploit Payload:\n`GET /api/v1/reports/preview?custom_notes=%3Cscript%3Ealert(document.cookie)%3C%2Fscript%3E`\nWhen visited by a user, the payload executes in the context of the user's session.",
+                      "markdown": "**Reflected Cross-Site Scripting in generate\\_printable\\_report\\_preview Endpoint**\n\nSource: Untrusted query parameters `report_title`, `client_name`, and `custom_notes` passed to `GET /api/v1/reports/preview`.\nValidation: None. The values are interpolated into an HTML string without escaping via `html.escape()`.\nSink: `return HTMLResponse(content=html_document, status_code=200)` renders the raw HTML in the user's browser.\nConceptual Exploit Payload:\n`GET /api/v1/reports/preview?custom_notes=%3Cscript%3Ealert(document.cookie)%3C%2Fscript%3E`\nWhen visited by a user, the payload executes in the context of the user's session.\n\n```\n@router.get(\"/preview\", response_class=HTMLResponse)\ndef generate_printable_report_preview(\n    report_title: str = Query(\n        \"Q1 Executive Billing Statement\",\n        description=\"Title displayed on the printable HTML report header\",\n    ),\n    client_name: str = Query(\n        \"Acme Global Corp\",\n        description=\"Client organization name displayed on the report\",\n    ),\n    custom_notes: str = Query(\n        \"All payments settled within Net-30 terms.\",\n        description=\"Custom analyst commentary or HTML notes section\",\n    ),\n):\n    html_document = f\"\"\"\u003c!DOCTYPE html\u003e\n\u003chtml lang=\"en\"\u003e\n\u003chead\u003e\n    \u003cmeta charset=\"UTF-8\"\u003e\n    \u003ctitle\u003eReport Preview - {report_title}\u003c/title\u003e\n...\n        \u003cdiv class=\"meta\"\u003e\n            Prepared for client organization: \u003cstrong\u003e{client_name}\u003c/strong\u003e\n        \u003c/div\u003e\n        \u003cdiv class=\"notes-box\"\u003e\n            \u003ch4\u003eAnalyst Notes \u0026 Terms\u003c/h4\u003e\n            \u003cdiv\u003e{custom_notes}\u003c/div\u003e\n        \u003c/div\u003e\n    \u003c/div\u003e\n\u003c/body\u003e\n\u003c/html\u003e\"\"\"\n\n    return HTMLResponse(content=html_document, status_code=200)\n```"
+                    },
+                    "locations": [
+                      {
+                        "physicalLocation": {
+                          "artifactLocation": {
+                            "uri": "app/routers/reports.py",
+                            "uriBaseId": "%SRCROOT%"
+                          },
+                          "region": {
+                            "startLine": 14,
+                            "endLine": 67,
+                            "snippet": {
+                              "text": "@router.get(\"/preview\", response_class=HTMLResponse)\ndef generate_printable_report_preview(\n    report_title: str = Query(\n        \"Q1 Executive Billing Statement\",\n        description=\"Title displayed on the printable HTML report header\",\n    ),\n    client_name: str = Query(\n        \"Acme Global Corp\",\n        description=\"Client organization name displayed on the report\",\n    ),\n    custom_notes: str = Query(\n        \"All payments settled within Net-30 terms.\",\n        description=\"Custom analyst commentary or HTML notes section\",\n    ),\n):\n    html_document = f\"\"\"\u003c!DOCTYPE html\u003e\n\u003chtml lang=\"en\"\u003e\n\u003chead\u003e\n    \u003cmeta charset=\"UTF-8\"\u003e\n    \u003ctitle\u003eReport Preview - {report_title}\u003c/title\u003e\n...\n        \u003cdiv class=\"meta\"\u003e\n            Prepared for client organization: \u003cstrong\u003e{client_name}\u003c/strong\u003e\n        \u003c/div\u003e\n        \u003cdiv class=\"notes-box\"\u003e\n            \u003ch4\u003eAnalyst Notes \u0026 Terms\u003c/h4\u003e\n            \u003cdiv\u003e{custom_notes}\u003c/div\u003e\n        \u003c/div\u003e\n    \u003c/div\u003e\n\u003c/body\u003e\n\u003c/html\u003e\"\"\"\n\n    return HTMLResponse(content=html_document, status_code=200)"
+                            }
+                          }
+                        }
+                      }
+                    ],
+                    "properties": {
+                      "security-severity": "5.0"
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+          EOF_SARIF
+          count=$(jq '.runs[0].results | length' findings.sarif)
+          echo "Loaded $count pre-generated SARIF findings into findings.sarif"
+
+      - name: Upload Findings to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: findings.sarif
+          category: codemender
