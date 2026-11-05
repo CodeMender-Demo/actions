@@ -585,7 +585,7 @@ jobs:
               wiz_output["variables"]["input"]["stepsToReproduce"] = input_finding.get("analysis", "")
               wiz_output["variables"]["input"]["weaknesses"] = [input_finding.get("vuln_id", "")]
               wiz_output["variables"]["input"]["reporterId"] = "CodeMender"
-              wiz_output["variables"]["input"]["reporterAt"] = now
+              wiz_output["variables"]["input"]["reportedAt"] = now
               wiz_output["variables"]["input"]["origin"] = "MANUAL"
 
               payload_path = f"wiz-payloads/payload-{idx}.json"
