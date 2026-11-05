@@ -1,6 +1,6 @@
 name: CodeMender Deep Scan to Wiz
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       model:
         description: "CodeMender reasoning model"
@@ -12,6 +12,15 @@ on:
         required: false
         default: "10"
         type: string
+    secrets:
+      WIF_PROVIDER:
+        required: true
+      WIF_SERVICE_ACCOUNT:
+        required: true
+      WIZ_CLIENT_ID:
+        required: true
+      WIZ_CLIENT_SECRET:
+        required: true
 
 permissions:
   contents: read
